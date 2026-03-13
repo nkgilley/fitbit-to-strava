@@ -216,6 +216,13 @@ def main():
                 desc += "(Heart rate data added via Fitbit sync)"
                 
                 try:
+                    # Prefer sport_type for specificity (e.g., MountainBikeRide)
+                    act_type = activity.get("sport_type") or activity.get("type")
+                    # Strava expects specific strings like "MountainBikeRide" (no spaces)
+                    if act_type:
+                        act_type = act_type.replace(" ", "")
+                    
+                    print(f"  Uploading as {act_type}...")
                     upload_resp = strava.upload_activity(
                         file_path=output_file,
                         data_type="tcx",
@@ -223,11 +230,18 @@ def main():
                         description=desc,
                         trainer=activity.get("trainer", False),
                         commute=activity.get("commute", False),
-                        gear_id=activity.get("gear_id") # Preserve original bike
+                        gear_id=activity.get("gear_id"),
+                        activity_type=act_type
                     )
                     new_id = upload_resp.get("activity_id")
                     print(f"  Upload successful! New Activity: https://www.strava.com/activities/{new_id}")
                     
+                    # Update activity to fix sport type specifically
+                    if act_type:
+                        print(f"  Updating sport type to {act_type}...")
+                        strava.update_activity(new_id, sport_type=act_type)
+                        print("  Sport type updated.")
+
                     log["completed"] = log.get("completed", [])
                     log["completed"].append({"old_id": act_id, "new_id": new_id, "date": start_date_local})
                     save_sync_log(log)

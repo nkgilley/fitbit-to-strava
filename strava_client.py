@@ -82,7 +82,7 @@ class StravaClient:
         url = "https://www.strava.com/api/v3/athlete"
         return self._request("GET", url)
 
-    def upload_activity(self, file_path, data_type="tcx", name=None, description=None, trainer=0, commute=0, gear_id=None):
+    def upload_activity(self, file_path, data_type="tcx", name=None, description=None, trainer=0, commute=0, gear_id=None, activity_type=None):
         # We handle upload separately because it uses multipart/form-data and polling
         url = "https://www.strava.com/api/v3/uploads"
         
@@ -96,6 +96,7 @@ class StravaClient:
             if name: data["name"] = name
             if description: data["description"] = description
             if gear_id: data["gear_id"] = gear_id
+            if activity_type: data["activity_type"] = activity_type
                 
             with open(file_path, "rb") as f:
                 files = {"file": f}
@@ -136,6 +137,10 @@ class StravaClient:
         
         raise Exception("Strava upload timed out.")
             
+    def update_activity(self, activity_id, **kwargs):
+        url = f"https://www.strava.com/api/v3/activities/{activity_id}"
+        return self._request("PUT", url, json=kwargs)
+
     def delete_activity(self, activity_id):
         url = f"https://www.strava.com/api/v3/activities/{activity_id}"
         try:

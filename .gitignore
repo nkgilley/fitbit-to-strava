@@ -13,6 +13,7 @@ sync_log.json
 # Project Data
 outputs/
 backups/
+trash/
 
 # IDEs
 .idea/

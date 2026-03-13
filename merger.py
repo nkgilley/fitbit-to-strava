@@ -30,12 +30,22 @@ def create_tcx(activity, streams, hr_data, output_path, include_creator=True):
     ET.register_namespace("xsi", ns_xsi)
     ET.register_namespace("tpx", ns_ext)
     
-    strava_type = activity.get("type", "Other")
+    strava_type = activity.get("sport_type") or activity.get("type", "Other")
     sport_map = {
-        "Ride": "Biking", "MountainBikeRide": "Biking", "E-BikeRide": "Biking",
-        "GravelRide": "Biking", "RoadRide": "Biking", "Run": "Running", "TrailRun": "Running",
-        "Biking": "Biking", "Running": "Running"
+        "Ride": "Biking", 
+        "MountainBikeRide": "MountainBikeRide", 
+        "E-BikeRide": "EBikeRide",
+        "GravelRide": "GravelRide", 
+        "RoadRide": "Biking", 
+        "Run": "Running", 
+        "TrailRun": "Running",
+        "Snowboard": "Snowboard", 
+        "Snowboarding": "Snowboard", 
+        "AlpineSki": "AlpineSki",
+        "Biking": "Biking", 
+        "Running": "Running"
     }
+
     tcx_sport = sport_map.get(strava_type, "Other")
     
     root = ET.Element(f"{{{ns}}}TrainingCenterDatabase", {
@@ -261,12 +271,16 @@ def parse_tcx(file_path):
         ext = pt.find("ns:Extensions", ns)
         w, s = None, None
         if ext is not None:
+            # Strava TCX uses TPX namespace for extensions
             tpx = ext.find(".//ns_ext:TPX", ns)
             if tpx is not None:
                 watts = tpx.find("ns_ext:Watts", ns)
-                w = int(watts.text) if watts is not None else None
+                if watts is not None:
+                    w = int(watts.text)
+                
                 speed = tpx.find("ns_ext:Speed", ns)
-                s = float(speed.text) if speed is not None else None
+                if speed is not None:
+                    s = float(speed.text)
         streams["watts"]["data"].append(w)
         streams["velocity_smooth"]["data"].append(s)
 
