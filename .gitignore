@@ -1,0 +1,20 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment & Secrets
+.env
+tokens.json
+sync_log.json
+
+# Project Data
+outputs/
+backups/
+
+# IDEs
+.idea/
+.vscode/
+.DS_Store
