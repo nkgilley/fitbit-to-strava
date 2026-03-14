@@ -307,6 +307,14 @@ def dashboard():
             @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
             @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
             .running-text {{ animation: pulse 1.5s infinite; color: #00d1ff; font-weight: bold; }}
+
+            /* Modal Styling */
+            .modal {{ display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }}
+            .modal-content {{ background-color: #fefefe; margin: 5% auto; padding: 30px; border-radius: 12px; width: 70%; max-width: 700px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); }}
+            .close {{ color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }}
+            .close:hover {{ color: black; }}
+            .help-step {{ margin-bottom: 20px; padding-left: 15px; border-left: 3px solid #0084ff; }}
+            .help-step h4 {{ margin: 0 0 5px 0; color: #0084ff; }}
         </style>
     </head>
     <body>
@@ -378,6 +386,7 @@ def dashboard():
                             <a href="/login/strava" class="btn btn-secondary" style="text-align:center; font-size:0.75em; padding: 6px;">Auth Strava</a>
                             <a href="/login/fitbit" class="btn btn-secondary" style="text-align:center; font-size:0.75em; padding: 6px;">Auth Fitbit</a>
                         </div>
+                        <button class="btn btn-secondary" onclick="document.getElementById('helpModal').style.display='block'">How to Use / Help</button>
                     </div>
                 </div>
 
@@ -435,6 +444,39 @@ def dashboard():
             </div>
         </div>
 
+        <!-- Help Modal -->
+        <div id="helpModal" class="modal">
+            <div class="modal-content">
+                <span class="close" onclick="document.getElementById('helpModal').style.display='none'">&times;</span>
+                <h2>How to Use Fitbit HR to Strava</h2>
+                <hr style="border:0; border-top:1px solid #eee; margin-bottom:20px;">
+                
+                <div class="help-step">
+                    <h4>Step 1: Authenticate</h4>
+                    <p>Ensure both the Strava and Fitbit badges in the header are blue (✓). If not, use the Re-auth buttons in the sidebar.</p>
+                </div>
+
+                <div class="help-step">
+                    <h4>Step 2: Scan for Missing Data</h4>
+                    <p>Use <b>Scan History</b> to see how many activities are missing heart rate data. "Fixable" means matching heart rate data was found in your Fitbit account.</p>
+                </div>
+
+                <div class="help-step">
+                    <h4>Step 3: Sync Activities</h4>
+                    <p>Enter how many activities to process (Activity Count) and how far back to look (History Depth). Click <b>Start Sync</b>. The original activities will NOT be deleted yet.</p>
+                </div>
+
+                <div class="help-step">
+                    <h4>Step 4: Verify & Cleanup</h4>
+                    <p>Check the "New" activities in the <b>Pending Cleanup</b> table. If they look good, manually delete the <b>Original</b> activities on Strava. Finally, click <b>Verify Manual Deletions</b> to move them to the history table.</p>
+                </div>
+
+                <div style="background:#f8f9fa; padding:15px; border-radius:8px; font-size:0.85em; color:#666;">
+                    <strong>Tip:</strong> We shift the time by 30 seconds (Bypass Duplicate) because Strava often blocks exact time matches even if the heart rate data is different.
+                </div>
+            </div>
+        </div>
+
         <script>
             const consoleBox = document.getElementById('console');
             consoleBox.scrollTop = consoleBox.scrollHeight;
@@ -469,6 +511,13 @@ def dashboard():
                     return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
                 }}).forEach(tr => tbody.appendChild(tr));
             }})));
+
+            // Close modal when clicking outside
+            window.onclick = function(event) {{
+                if (event.target == document.getElementById('helpModal')) {{
+                    document.getElementById('helpModal').style.display = "none";
+                }}
+            }}
         </script>
     </body>
     </html>
