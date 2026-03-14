@@ -69,8 +69,8 @@ class StravaClient:
             
         return resp.json()
 
-    def get_activities(self, per_page=30):
-        url = f"https://www.strava.com/api/v3/athlete/activities?per_page={per_page}"
+    def get_activities(self, per_page=30, page=1):
+        url = f"https://www.strava.com/api/v3/athlete/activities?per_page={per_page}&page={page}"
         return self._request("GET", url)
 
     def get_activity_streams(self, activity_id):

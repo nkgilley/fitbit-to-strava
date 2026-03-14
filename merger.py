@@ -140,49 +140,11 @@ def create_tcx(activity, streams, hr_data, output_path, include_creator=True):
     with open(output_path, "w") as f:
         f.write(parsed.toprettyxml(indent="  "))
 
-def inject_hr_to_fit(input_path, hr_data, output_path):
-    """
-    Reads a binary FIT file, injects heart rate data into every record message,
-    and saves a new binary FIT file.
-    """
-    from fit_tool.fit_file import FitFile
-    from fit_tool.profile.messages.record_message import RecordMessage
-    
-    fit_file = FitFile.from_file(input_path)
-    FIT_EPOCH = 631065600
-    
-    modified_count = 0
-    for record in fit_file.records:
-        message = record.message
-        if isinstance(message, RecordMessage):
-            ts_val = message.timestamp
-            
-            # CRITICAL: Handle if fit-tool gives int or datetime
-            if isinstance(ts_val, int):
-                dt = datetime.fromtimestamp(ts_val + FIT_EPOCH)
-            else:
-                dt = ts_val
-            
-            hr_val = None
-            for offset_sec in range(0, 5):
-                check_time = dt - timedelta(seconds=offset_sec)
-                time_key = check_time.strftime("%H:%M:%S")
-                if time_key in hr_data:
-                    hr_val = hr_data[time_key]
-                    break
-            
-            if hr_val:
-                message.heart_rate = int(hr_val)
-                modified_count += 1
-                    
-    print(f"  [FIT] Injected heart rate into {modified_count} records.")
-    fit_file.to_file(output_path)
-
 def parse_fit(file_path):
     import fitparse
     fitfile = fitparse.FitFile(file_path)
     
-    streams = {k: {"data": []} for k in ["time", "latlng", "distance", "altitude", "watts", "cadence", "velocity_smooth"]}
+    streams = {k: {"data": []} for k in ["time", "latlng", "distance", "altitude", "watts", "cadence", "velocity_smooth", "heartrate"]}
     
     start_dt = None
     sport = "Other"
@@ -209,34 +171,16 @@ def parse_fit(file_path):
             
         streams["altitude"]["data"].append(values.get("altitude"))
         streams["distance"]["data"].append(values.get("distance"))
-        
-        pwr = values.get("power") or values.get("instantaneous_power")
-        streams["watts"]["data"].append(pwr)
-        
+        streams["watts"]["data"].append(values.get("power") or values.get("instantaneous_power"))
         streams["cadence"]["data"].append(values.get("cadence"))
         streams["velocity_smooth"]["data"].append(values.get("speed"))
+        streams["heartrate"]["data"].append(values.get("heart_rate"))
 
     for msg in fitfile.get_messages("sport"):
         sport_val = msg.get_value("sport")
         if sport_val: sport = str(sport_val).replace('_', '').capitalize()
 
     start_time_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if start_dt else None
-    
-    raw_alt = streams["altitude"]["data"]
-    if raw_alt and any(a is not None for a in raw_alt):
-        smoothed_alt = []
-        last_val = None
-        for val in raw_alt:
-            if val is None:
-                smoothed_alt.append(None)
-                continue
-            if last_val is None:
-                last_val = val
-            elif abs(val - last_val) > 1.0: # 1.0m threshold
-                last_val = val
-            smoothed_alt.append(last_val)
-        streams["altitude"]["data"] = smoothed_alt
-
     return {"type": sport, "start_date": start_time_str, "start_date_local": start_time_str, "name": f"Restored FIT Activity ({start_time_str})"}, streams
 
 def parse_tcx(file_path):
@@ -250,7 +194,7 @@ def parse_tcx(file_path):
     start_time_utc = root.find(".//ns:Id", ns).text
     start_dt = parse_date(start_time_utc)
     
-    streams = {k: {"data": []} for k in ["time", "latlng", "distance", "altitude", "watts", "cadence", "velocity_smooth"]}
+    streams = {k: {"data": []} for k in ["time", "latlng", "distance", "altitude", "watts", "cadence", "velocity_smooth", "heartrate"]}
     
     for pt in root.findall(".//ns:Trackpoint", ns):
         pt_dt = parse_date(pt.find("ns:Time", ns).text)
@@ -268,19 +212,22 @@ def parse_tcx(file_path):
         cad = pt.find("ns:Cadence", ns)
         streams["cadence"]["data"].append(int(cad.text) if cad is not None else None)
         
+        hr = pt.find("ns:HeartRateBpm", ns)
+        hr_val = None
+        if hr is not None:
+            v_el = hr.find("ns:Value", ns)
+            if v_el is not None: hr_val = int(v_el.text)
+        streams["heartrate"]["data"].append(hr_val)
+        
         ext = pt.find("ns:Extensions", ns)
         w, s = None, None
         if ext is not None:
-            # Strava TCX uses TPX namespace for extensions
             tpx = ext.find(".//ns_ext:TPX", ns)
             if tpx is not None:
                 watts = tpx.find("ns_ext:Watts", ns)
-                if watts is not None:
-                    w = int(watts.text)
-                
+                w = int(watts.text) if watts is not None else None
                 speed = tpx.find("ns_ext:Speed", ns)
-                if speed is not None:
-                    s = float(speed.text)
+                s = float(speed.text) if speed is not None else None
         streams["watts"]["data"].append(w)
         streams["velocity_smooth"]["data"].append(s)
 

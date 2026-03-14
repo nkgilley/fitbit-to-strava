@@ -1,4 +1,4 @@
-# Fitbit to Strava Heart Rate Synchronizer
+# Fitbit HR to Strava
 
 This tool automatically fetches missing heart rate data from your Fitbit account and merges it into your existing Strava activities. It identifies Strava activities without heart rate data, downloads their GPS streams, retrieves matching Fitbit HR data, generates a new TCX file, and handles the replacement process.
 
@@ -8,6 +8,7 @@ This tool automatically fetches missing heart rate data from your Fitbit account
 - **Intelligent Merging:** Aligns Fitbit HR data with Strava GPS time streams using UTC/Local time offsets.
 - **Rate Limited:** Built-in delays to respect Strava and Fitbit API limits.
 - **Granular Control:** Sync all activities, a specific number, or a single activity ID.
+- **Web Control Center:** Real-time dashboard to monitor syncs, scan history, and manage skipped activities.
 
 ## Setup Instructions
 
@@ -27,27 +28,31 @@ This tool automatically fetches missing heart rate data from your Fitbit account
        - **Application Type: MUST BE "Personal"**
        - Callback URL: `http://127.0.0.1:8080/callback/fitbit`
 
-3. **Authenticate**
+3. **Start the Control Center**
    ```bash
-   python auth.py
+   python app.py
    ```
    Open `http://127.0.0.1:8080` and log in to both services. This creates `tokens.json`.
 
 ## Usage Guide
 
-### Sync and Upload
-Find missing data, backup the original, delete the old activity (to avoid Strava duplicate detection), and upload the new activity with heart rate data.
+### Web Dashboard (Recommended)
+Trigger scans and syncs directly from the web interface. You can see live terminal output as activities are processed.
 
+### CLI Usage
+You can still run the tool directly from the terminal:
 ```bash
-# Test with one activity (recommended for first run)
-python main.py --limit 1
+# Sync recent history
+python main.py --pages 1 --limit 5 --bypass-duplicate
 
-# Sync all recent activities
-python main.py
+# Sync a specific file (Garmin Export)
+python main.py --file ~/Downloads/activity.fit --bypass-duplicate
+
+# Run log cleanup
+python main.py --cleanup
 ```
-*Note: Original activities are deleted from Strava immediately during this process, but a backup is always saved to the `backups/` directory first.*
 
 ## Troubleshooting
 - **403 Permission Denied (Fitbit):** Ensure your Fitbit App Type is set to **Personal**. Intraday HR data is restricted for "Server" or "Client" app types.
 - **Time Offsets:** The tool uses `start_date` (UTC) for TCX timestamps and `start_date_local` for Fitbit data matching.
-- **Port Conflicts:** If port 8080 is in use, you can change it at the bottom of `auth.py`.
+- **Port Conflicts:** If port 8080 is in use, you can change it at the bottom of `app.py`.

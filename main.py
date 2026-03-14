@@ -17,7 +17,7 @@ def load_sync_log():
                 return json.load(f)
             except json.JSONDecodeError:
                 pass
-    return {"pending_cleanup": [], "completed": []}
+    return {"pending_cleanup": [], "completed": [], "skipped": []}
 
 def save_sync_log(log):
     with open(SYNC_LOG, "w") as f:
@@ -27,45 +27,64 @@ def cleanup_activities(strava):
     log = load_sync_log()
     pending = log.get("pending_cleanup", [])
     
-    if not pending:
-        print("No activities pending cleanup in sync_log.json.")
+    if not pending and not log.get("completed"):
+        print("No activities in sync_log.json.")
         return
 
-    print(f"Found {len(pending)} activities pending cleanup.")
-    remaining = []
+    print(f"Verifying {len(pending)} pending activities on Strava...")
+    still_pending = []
+    completed = log.get("completed", [])
+    
+    import requests
     for item in pending:
         old_id = item["old_id"]
-        name = item.get("name", "Unknown")
-        date = item.get("date", "Unknown")
-        
-        confirm = input(f"Delete original activity {old_id} ('{name}' on {date})? (y/N/all): ")
-        if confirm.lower() == 'all':
-            to_delete = [i for i in pending if i not in remaining]
-            for d_item in to_delete:
-                try:
-                    print(f"  Deleting {d_item['old_id']}...")
-                    strava.delete_activity(d_item['old_id'])
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"  Failed to delete {d_item['old_id']}: {e}")
-                    remaining.append(d_item)
-            break
-        elif confirm.lower() == 'y':
+        try:
+            strava.get_activity_streams(old_id)
+            still_pending.append(item)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"  Confirmed: Activity {old_id} was manually deleted. Moving to completed.")
+                completed.append(item)
+            else:
+                still_pending.append(item)
+        except Exception:
+            still_pending.append(item)
+
+    print("Backfilling missing stats from Strava...")
+    all_items = still_pending + completed
+    for item in all_items:
+        if 'distance_mi' not in item or 'elevation_gain_ft' not in item or item.get('name') == 'N/A' or not item.get('name'):
             try:
-                print(f"  Deleting {old_id}...")
-                strava.delete_activity(old_id)
-                print("  Deleted successfully.")
-                time.sleep(1)
+                new_id = item.get("new_id")
+                if not new_id: continue
+                
+                print(f"  Fetching stats for new activity {new_id}...")
+                url = f"https://www.strava.com/api/v3/activities/{new_id}"
+                act_data = strava._request("GET", url)
+                
+                item["name"] = act_data.get("name", item.get("name"))
+                item["distance_mi"] = round(act_data.get("distance", 0) / 1609.34, 2)
+                item["duration_min"] = round(act_data.get("moving_time", 0) / 60.0, 1)
+                
+                if act_data.get("total_elevation_gain"):
+                    item["elevation_gain_ft"] = int(act_data.get("total_elevation_gain") * 3.28084)
+                else:
+                    item["elevation_gain_ft"] = 0
+                
+                time.sleep(0.5)
             except Exception as e:
-                print(f"  Failed to delete {old_id}: {e}")
-                remaining.append(item)
-        else:
-            print(f"  Skipping {old_id}.")
-            remaining.append(item)
-            
-    log["pending_cleanup"] = remaining
+                print(f"  Failed to backfill {item.get('new_id')}: {e}")
+
+    log["pending_cleanup"] = still_pending
+    log["completed"] = completed
     save_sync_log(log)
-    print("\nCleanup complete. sync_log.json updated.")
+    
+    if len(pending) != len(still_pending):
+        print(f"\nDashboard updated: {len(pending) - len(still_pending)} activities moved to 'Completed'.")
+    else:
+        print("\nNo log movements. (Manually delete originals on Strava to move them to 'Completed').")
+    
+    print(f"Remaining pending cleanup: {len(still_pending)}")
 
 def parse_date(date_str):
     if not date_str:
@@ -80,6 +99,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Don't upload to Strava or modify anything.")
     parser.add_argument("--cleanup", action="store_true", help="Delete old activities that have already been synced.")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of activities to process.")
+    parser.add_argument("--pages", type=int, default=1, help="Number of pages (50 per page) to fetch from Strava history.")
     parser.add_argument("--id", type=int, help="Process a specific Strava activity ID.")
     parser.add_argument("--file", type=str, help="Process a local FIT/TCX file instead of fetching from Strava.")
     parser.add_argument("--bypass-duplicate", action="store_true", help="Shift start time by 1 second to bypass Strava duplicate detection.")
@@ -106,8 +126,15 @@ def main():
 
     log = load_sync_log()
     completed_ids = {item["old_id"] for item in log.get("completed", [])}
+    pending_ids = {item["old_id"] for item in log.get("pending_cleanup", [])}
     
-    missing_hr_data = [] # List of (activity_dict, streams_dict)
+    raw_skipped = log.get("skipped", [])
+    skipped_ids = set()
+    for s in raw_skipped:
+        if isinstance(s, dict): skipped_ids.add(s["id"])
+        else: skipped_ids.add(s)
+    
+    missing_hr_data = []
 
     if args.file:
         if args.file.lower().endswith(".fit"):
@@ -117,21 +144,46 @@ def main():
             print(f"Loading local TCX file: {args.file}")
             activity, streams = parse_tcx(args.file)
         
+        has_hr = False
+        if activity.get("has_heartrate"):
+            has_hr = True
+        elif streams.get("heartrate") and any(h is not None for h in streams["heartrate"].get("data", [])):
+            has_hr = True
+            
+        if has_hr:
+            print(f"  [Skip] Local file already contains heart rate data.")
+            return
+
         act_id = os.path.basename(args.file).split(".")[0]
         activity["id"] = act_id
         missing_hr_data.append((activity, streams))
     else:
-        print("Fetching recent Strava activities...")
-        activities = strava.get_activities(per_page=50)
+        print(f"Fetching Strava activities ({args.pages} pages)...")
+        activities = []
+        for p in range(1, args.pages + 1):
+            print(f"  Page {p}...")
+            page_data = strava.get_activities(per_page=50, page=p)
+            if not page_data: break
+            activities.extend(page_data)
+            time.sleep(0.5)
         
         target_activities = []
         if args.id:
             target_activities = [a for a in activities if a["id"] == args.id]
             if not target_activities:
-                print(f"Activity {args.id} not found in the most recent 50 activities.")
+                print(f"Activity {args.id} not found in fetched activities.")
                 return
         else:
-            target_activities = [a for a in activities if not a.get("has_heartrate") and a["id"] not in completed_ids]
+            for a in activities:
+                if a.get("has_heartrate") or a["id"] in completed_ids or a["id"] in pending_ids or a["id"] in skipped_ids:
+                    continue
+                if a.get("total_photo_count", 0) > 0:
+                    print(f"  [Skip] Activity {a['id']} has photos. Skipping.")
+                    log["skipped"] = log.get("skipped", [])
+                    log["skipped"].append({"id": a["id"], "name": a.get("name", "Unknown") + " (Has Photos)", "date": a.get("start_date_local", "N/A")})
+                    save_sync_log(log)
+                    continue
+                target_activities.append(a)
 
         if not target_activities:
             print("No activities found to process.")
@@ -142,9 +194,19 @@ def main():
             print(f"Limited to first {args.limit} activities.")
         
         for activity in target_activities:
-            print(f"  Fetching streams for {activity['id']}...")
-            streams = strava.get_activity_streams(activity["id"])
-            missing_hr_data.append((activity, streams))
+            try:
+                print(f"  Fetching streams for {activity['id']}...")
+                streams = strava.get_activity_streams(activity["id"])
+                missing_hr_data.append((activity, streams))
+            except Exception as e:
+                if "404" in str(e):
+                    print(f"  [Skip] Activity {activity['id']} not found. Adding to skipped list.")
+                    log["skipped"] = log.get("skipped", [])
+                    log["skipped"].append({"id": activity["id"], "name": activity.get("name", "Unknown"), "date": activity.get("start_date_local", "N/A")})
+                    save_sync_log(log)
+                else:
+                    print(f"  [Skip] Could not fetch streams for {activity['id']}: {e}")
+                continue
 
     print(f"Processing {len(missing_hr_data)} activities.")
     
@@ -161,13 +223,14 @@ def main():
             time.sleep(1)
         
         start_dt = parse_date(start_date_local)
-        
+        act_duration_sec = activity.get("elapsed_time") or activity.get("moving_time")
         if streams.get("time") and streams["time"].get("data"):
-            duration = streams["time"]["data"][-1]
-        else:
-            duration = activity.get("elapsed_time", 3600)
+            act_duration_sec = streams["time"]["data"][-1]
+        
+        if not act_duration_sec:
+            act_duration_sec = 3600
             
-        end_dt = start_dt + timedelta(seconds=duration)
+        end_dt = start_dt + timedelta(seconds=act_duration_sec)
         date_str = start_dt.strftime("%Y-%m-%d")
         start_time_str = start_dt.strftime("%H:%M")
         end_time_str = (end_dt + timedelta(minutes=5)).strftime("%H:%M")
@@ -190,22 +253,25 @@ def main():
             if args.bypass_duplicate:
                 start_dt_utc = parse_date(activity.get('start_date'))
                 start_dt_local = parse_date(activity.get('start_date_local'))
-                activity['start_date'] = (start_dt_utc + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                activity['start_date_local'] = (start_dt_local + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                print("  Applied 1-second shift to bypass duplicate detection.")
+                # Use a 30 second shift to be more distinctive for Strava
+                activity['start_date'] = (start_dt_utc + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                activity['start_date_local'] = (start_dt_local + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                print("  Applied 30-second shift to bypass duplicate detection.")
 
             output_file = f"outputs/{act_id}_with_hr.tcx"
             print(f"  Generating merged TCX file...")
             create_tcx(activity, streams, hr_data, output_file, include_creator=(not args.force_elevation))
             
-            # Debug Elevation Gain
             a_data = [a for a in streams.get("altitude", {}).get("data", []) if a is not None]
+            total_gain_ft = 0
             if a_data:
-                gain = 0
+                gain_m = 0
                 for i in range(1, len(a_data)):
                     diff = a_data[i] - a_data[i-1]
-                    if diff > 0: gain += diff
-                print(f"  [Debug] Raw elevation gain in file: {gain * 3.28084:.0f} ft")
+                    if diff > 0: gain_m += diff
+                total_gain_ft = int(gain_m * 3.28084)
+            dist_km = streams.get("distance", {}).get("data", [-1])[-1] / 1000.0 if streams.get("distance") else 0
+            dist_mi = dist_km * 0.621371
 
             if args.dry_run:
                 print("  Dry-run: skipping upload.")
@@ -216,13 +282,9 @@ def main():
                 desc += "(Heart rate data added via Fitbit sync)"
                 
                 try:
-                    # Prefer sport_type for specificity (e.g., MountainBikeRide)
                     act_type = activity.get("sport_type") or activity.get("type")
-                    # Strava expects specific strings like "MountainBikeRide" (no spaces)
-                    if act_type:
-                        act_type = act_type.replace(" ", "")
+                    if act_type: act_type = act_type.replace(" ", "")
                     
-                    print(f"  Uploading as {act_type}...")
                     upload_resp = strava.upload_activity(
                         file_path=output_file,
                         data_type="tcx",
@@ -236,22 +298,24 @@ def main():
                     new_id = upload_resp.get("activity_id")
                     print(f"  Upload successful! New Activity: https://www.strava.com/activities/{new_id}")
                     
-                    # Update activity to fix sport type specifically
                     if act_type:
-                        print(f"  Updating sport type to {act_type}...")
                         strava.update_activity(new_id, sport_type=act_type)
-                        print("  Sport type updated.")
 
-                    log["completed"] = log.get("completed", [])
-                    log["completed"].append({"old_id": act_id, "new_id": new_id, "date": start_date_local})
+                    log["pending_cleanup"] = log.get("pending_cleanup", [])
+                    log["pending_cleanup"].append({
+                        "old_id": act_id, 
+                        "new_id": new_id, 
+                        "name": act_name,
+                        "date": start_date_local,
+                        "distance_mi": round(dist_mi, 2),
+                        "duration_min": round(act_duration_sec / 60.0, 1),
+                        "elevation_gain_ft": total_gain_ft
+                    })
                     save_sync_log(log)
                     
                 except Exception as upload_err:
                     if "duplicate" in str(upload_err).lower():
                         print(f"  [!] Strava blocked upload as a duplicate.")
-                        print(f"  To fix this, you must EITHER:")
-                        print(f"    1. Manually delete the original activity on Strava.")
-                        print(f"    2. Run again with the --bypass-duplicate flag.")
                     else:
                         raise upload_err
         
