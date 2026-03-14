@@ -8,7 +8,7 @@ This tool automatically fetches missing heart rate data from your Fitbit account
 - **Deep History Scanning:** Performs a two-step check (Strava missing HR + Fitbit has data) to identify "Fixable" activities.
 - **Local Data Caching:** The deep scan caches **all** metadata and high-res streams (Strava + Fitbit) locally in your database. This makes the final sync near-instant and extremely efficient with API quotas.
 - **Optimized Syncing:** "Only Fixable" mode skips repetitive scanning and targets confirmed activities using cached data.
-- **Real-time Web Dashboard:** Monitor progress via a live terminal stream with persistent history across reloads.
+- **Real-time Web Dashboard:** Trigger scans, monitor progress via a live terminal stream, and manage your history with AJAX-powered search and sortable tables.
 - **Data Preservation:** Automatically skips activities with photos to prevent accidental data loss.
 - **Unit Support:** Fully supports Imperial units (mi/ft) for all dashboard statistics.
 - **Database Driven:** Uses SQLAlchemy (SQLite by default) for secure token and history management.
