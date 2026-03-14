@@ -9,11 +9,15 @@ __pycache__/
 .env
 tokens.json
 sync_log.json
+data.db
+data.db-journal
 
 # Project Data
 outputs/
 backups/
-trash/
+
+# Utilities
+migrate_to_db.py
 
 # IDEs
 .idea/

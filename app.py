@@ -9,13 +9,13 @@ import queue
 from flask import Flask, request, redirect, url_for, session, Response
 from datetime import datetime
 from dotenv import load_dotenv
+from database import init_db, SessionLocal, Token, SyncedActivity, SkippedActivity, ScanResult
 
 load_dotenv()
+init_db()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "super_secret_key")
-
-TOKENS_FILE = "tokens.json"
 
 # Simple thread-safe queue for terminal lines
 terminal_queue = queue.Queue()
@@ -36,13 +36,18 @@ FITBIT_AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
 FITBIT_TOKEN_URL = "https://api.fitbit.com/oauth2/token"
 
 def save_tokens(service, token_data):
-    tokens = {}
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE, "r") as f:
-            tokens = json.load(f)
-    tokens[service] = token_data
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=4)
+    db = SessionLocal()
+    token = db.query(Token).filter(Token.service == service).first()
+    if not token:
+        token = Token(service=service)
+        db.add(token)
+    
+    token.access_token = token_data.get("access_token")
+    token.refresh_token = token_data.get("refresh_token")
+    token.expires_at = token_data.get("expires_at") or token_data.get("expires_in")
+    token.other_data = token_data
+    db.commit()
+    db.close()
 
 def log_terminal(line):
     global terminal_history
@@ -65,24 +70,16 @@ def run_command_stream(cmd):
     
     try:
         process = subprocess.Popen(
-            full_cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT, 
-            text=True, 
-            bufsize=1
+            full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
-        
         for line in iter(process.stdout.readline, ""):
             log_terminal(line.strip())
-            
         process.wait()
         if process.returncode == 0:
             process_status["message"] = "Process finished successfully."
         else:
             process_status["message"] = f"Process failed with exit code {process.returncode}."
-        
         log_terminal("[DONE]")
-            
     except Exception as e:
         process_status["message"] = f"Execution failed: {str(e)}"
         log_terminal(f"ERROR: {str(e)}")
@@ -101,18 +98,11 @@ def run_scan_in_background(pages):
         
         strava = StravaClient()
         fitbit = FitbitClient()
+        db = SessionLocal()
         
-        log = {"completed":[], "pending_cleanup":[], "skipped":[]}
-        if os.path.exists("sync_log.json"):
-            with open("sync_log.json", "r") as f:
-                log = json.load(f)
-        
-        completed_ids = {item["old_id"] for item in log.get("completed", [])}
-        pending_ids = {item["old_id"] for item in log.get("pending_cleanup", [])}
-        skipped_ids = set()
-        for s in log.get("skipped", []):
-            if isinstance(s, dict): skipped_ids.add(s["id"])
-            else: skipped_ids.add(s)
+        completed_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()}
+        pending_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").all()}
+        skipped_ids = {a.id for a in db.query(SkippedActivity).all()}
 
         missing_count = 0
         fixable_count = 0
@@ -123,22 +113,19 @@ def run_scan_in_background(pages):
             if not activities: break
             
             for a in activities:
-                if a.get("has_heartrate"): continue
-                if a["id"] in completed_ids or a["id"] in pending_ids or a["id"] in skipped_ids: continue
+                a_id = str(a["id"])
+                if a.get("has_heartrate") or a_id in completed_ids or a_id in pending_ids or a_id in skipped_ids:
+                    continue
                 if a.get("total_photo_count", 0) > 0: continue
                 
                 missing_count += 1
-                
                 start_date_local = a.get("start_date_local")
                 if not start_date_local: continue
                 
                 start_dt = parse_date(start_date_local)
                 dur = a.get("elapsed_time") or 3600
                 end_dt = start_dt + timedelta(seconds=dur)
-                
-                date_str = start_dt.strftime("%Y-%m-%d")
-                s_time = start_dt.strftime("%H:%M")
-                e_time = (end_dt + timedelta(minutes=5)).strftime("%H:%M")
+                date_str, s_time, e_time = start_dt.strftime("%Y-%m-%d"), start_dt.strftime("%H:%M"), (end_dt + timedelta(minutes=5)).strftime("%H:%M")
                 
                 try:
                     hr_points = fitbit.get_hr_data(date_str, s_time, e_time)
@@ -147,27 +134,23 @@ def run_scan_in_background(pages):
                         log_terminal(f"  [Fixable] {a.get('name')} ({date_str})")
                     else:
                         log_terminal(f"  [No Data] {a.get('name')} ({date_str})")
-                except:
-                    pass
-                
+                except: pass
                 time.sleep(0.3)
             
         scan_results["count"] = missing_count
         scan_results["fixable_count"] = fixable_count
         scan_results["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        if os.path.exists("sync_log.json"):
-            with open("sync_log.json", "r") as f:
-                full_log = json.load(f)
-        else:
-            full_log = {"pending_cleanup":[], "completed":[], "skipped":[]}
-        
-        full_log["last_scan"] = scan_results.copy()
-        with open("sync_log.json", "w") as f:
-            json.dump(full_log, f, indent=4)
-            
+        scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
+        if not scan_record:
+            scan_record = ScanResult(id=1)
+            db.add(scan_record)
+        scan_record.count = missing_count
+        scan_record.fixable_count = fixable_count
+        scan_record.last_scan = scan_results["last_scan"]
+        db.commit()
+        db.close()
         log_terminal(f">>> Scan complete. Found {missing_count} total, {fixable_count} fixable.")
-            
     except Exception as e:
         log_terminal(f"Scan failed: {e}")
     finally:
@@ -216,54 +199,46 @@ def start_cleanup():
 
 @app.route("/clear_skipped", methods=["POST"])
 def clear_skipped():
-    if os.path.exists("sync_log.json"):
-        with open("sync_log.json", "r") as f:
-            log = json.load(f)
-        log["skipped"] = []
-        with open("sync_log.json", "w") as f:
-            json.dump(log, f, indent=4)
+    db = SessionLocal()
+    db.query(SkippedActivity).delete()
+    db.commit()
+    db.close()
     return redirect(url_for("dashboard"))
 
 @app.route("/dashboard")
 def dashboard():
-    log = {"completed":[], "pending_cleanup":[], "skipped":[], "last_scan": {"count":0, "fixable_count":0, "last_scan":"Never"}}
-    if os.path.exists("sync_log.json"):
-        with open("sync_log.json", "r") as f:
-            log = json.load(f)
+    db = SessionLocal()
     
+    # Load scan results
+    scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
     global scan_results
-    if not scan_results["scanning"] and "last_scan" in log:
-        scan_results.update(log["last_scan"])
+    if scan_record and not scan_results["scanning"]:
+        scan_results["count"] = scan_record.count
+        scan_results["fixable_count"] = scan_record.fixable_count
+        scan_results["last_scan"] = scan_record.last_scan
         scan_results["scanning"] = False
+
+    strava_auth = db.query(Token).filter(Token.service == "strava").first() is not None
+    fitbit_auth = db.query(Token).filter(Token.service == "fitbit").first() is not None
     
-    tokens = {}
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE, "r") as f:
-            tokens = json.load(f)
-    
-    strava_auth = "strava" in tokens
-    fitbit_auth = "fitbit" in tokens
-    completed = log.get("completed", [])
-    pending = log.get("pending_cleanup", [])
-    skipped = log.get("skipped", [])
-    
-    # Sort completed by date descending by default
-    completed.sort(key=lambda x: x.get('date', ''), reverse=True)
+    completed = db.query(SyncedActivity).filter(SyncedActivity.status == "completed").order_by(SyncedActivity.date.desc()).all()
+    pending = db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").order_by(SyncedActivity.date.desc()).all()
+    skipped = db.query(SkippedActivity).all()
     
     # Pagination
     items_per_page = 25
     total_pages = max(1, (len(completed) + items_per_page - 1) // items_per_page)
     current_page = max(1, min(int(request.args.get('page', 1)), total_pages))
-    
     start_idx = (current_page - 1) * items_per_page
-    end_idx = start_idx + items_per_page
-    paginated_completed = completed[start_idx:end_idx]
+    paginated_completed = completed[start_idx : start_idx + items_per_page]
     
+    db.close()
+
     def format_stats(item):
-        if 'distance_mi' in item: dist = f"{item['distance_mi']} mi"
-        elif 'distance_km' in item: dist = f"{round(item['distance_km'] * 0.621371, 2)} mi"
-        else: dist = "N/A"
-        return f"{dist} | {item.get('duration_min', 'N/A')} min | {item.get('elevation_gain_ft', 'N/A')} ft"
+        dist = f"{item.distance_mi or 0.0} mi"
+        dur = f"{item.duration_min or 0.0} min"
+        elev = f"{item.elevation_gain_ft or 0} ft"
+        return f"{dist} | {dur} | {elev}"
 
     initial_console = "\\n".join(terminal_history) if terminal_history else "--- System Idle ---"
 
@@ -290,31 +265,23 @@ def dashboard():
             .auth-badge {{ padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; }}
             .auth-ok {{ background: #e7f3ff; color: #1877f2; }}
             .auth-missing {{ background: #fff0f0; color: #fa3e3e; }}
-            
             .status-bar {{ background: #000; color: #fff; padding: 15px; border-radius: 6px; font-family: monospace; margin-bottom: 20px; border-left: 4px solid #31a24c; font-size: 0.9em; display: flex; align-items: center; }}
             .status-label {{ color: #31a24c; font-weight: bold; margin-right: 10px; }}
-            
             .spinner {{ width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #00d1ff; animation: spin 1s linear infinite; margin-right: 12px; display: none; }}
             .running .spinner {{ display: inline-block; }}
-            
             #console {{ background: #000; color: #fff; padding: 15px; border-radius: 0 0 6px 6px; font-family: monospace; height: 150px; overflow-y: auto; font-size: 0.85em; border-left: 4px solid #31a24c; white-space: pre-wrap; }}
             .console-header {{ background: #1c1e21; color: #31a24c; padding: 8px 15px; border-radius: 6px 6px 0 0; font-size: 0.75em; font-weight: bold; border-left: 4px solid #31a24c; cursor: pointer; }}
             .stat-pill {{ color: #65676b; font-size: 0.85em; }}
             .scan-box {{ background: #f7f9fc; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #e1e4e8; }}
-            
             .pagination {{ margin-top: 15px; display: flex; justify-content: center; align-items: center; gap: 15px; font-size: 0.9em; }}
-            
-            @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-            @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
-            .running-text {{ animation: pulse 1.5s infinite; color: #00d1ff; font-weight: bold; }}
-
-            /* Modal Styling */
             .modal {{ display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }}
             .modal-content {{ background-color: #fefefe; margin: 5% auto; padding: 30px; border-radius: 12px; width: 70%; max-width: 700px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); }}
             .close {{ color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }}
-            .close:hover {{ color: black; }}
             .help-step {{ margin-bottom: 20px; padding-left: 15px; border-left: 3px solid #0084ff; }}
             .help-step h4 {{ margin: 0 0 5px 0; color: #0084ff; }}
+            @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+            @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
+            .running-text {{ animation: pulse 1.5s infinite; color: #00d1ff; font-weight: bold; }}
         </style>
     </head>
     <body>
@@ -395,7 +362,7 @@ def dashboard():
                     <details style="margin-bottom: 15px; font-size: 0.85em;">
                         <summary style="cursor:pointer; color:#0084ff; font-weight:600;">Show Details</summary>
                         <ul style="padding-left: 20px; margin-top: 10px; max-height: 200px; overflow-y: auto;">
-                            {"".join([f"<li><a href='https://www.strava.com/activities/{s['id'] if isinstance(s, dict) else s}' target='_blank'>{s.get('name', s.get('id', s)) if isinstance(s, dict) else s}</a></li>" for s in skipped])}
+                            {"".join([f"<li><a href='https://www.strava.com/activities/{s.id}' target='_blank'>{s.name}</a></li>" for s in skipped])}
                         </ul>
                     </details>
                     <form action="/clear_skipped" method="post">
@@ -415,7 +382,7 @@ def dashboard():
                         </thead>
                         <tbody>
                             {"<tr><td colspan='4' style='text-align:center; color:#65676b;'>No activities waiting.</td></tr>" if not pending else ""}
-                            {"".join([f"<tr><td>{i.get('date','N/A')[:10]}</td><td>{i.get('name','N/A')}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.get('new_id')}' target='_blank'>New</a> | <a href='https://www.strava.com/activities/{i.get('old_id')}' target='_blank'>Original</a></td></tr>" for i in pending])}
+                            {"".join([f"<tr><td>{i.date[:10]}</td><td>{i.name}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.new_id}' target='_blank'>New</a> | <a href='https://www.strava.com/activities/{i.old_id}' target='_blank'>Original</a></td></tr>" for i in pending])}
                         </tbody>
                     </table>
                 </div>
@@ -430,10 +397,9 @@ def dashboard():
                         </thead>
                         <tbody>
                             {"<tr><td colspan='4' style='text-align:center; color:#65676b;'>No history yet.</td></tr>" if not paginated_completed else ""}
-                            {"".join([f"<tr><td>{i.get('date','N/A')[:10]}</td><td>{i.get('name','N/A')}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.get('new_id')}' target='_blank'>View Activity</a></td></tr>" for i in paginated_completed])}
+                            {"".join([f"<tr><td>{i.date[:10]}</td><td>{i.name}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.new_id}' target='_blank'>View Activity</a></td></tr>" for i in paginated_completed])}
                         </tbody>
                     </table>
-                    
                     <div class="pagination">
                         <a href="?page={current_page - 1}" class="btn btn-secondary" {"style='visibility:hidden'" if current_page <= 1 else ""}>&larr; Prev</a>
                         <span>Page {current_page} of {total_pages}</span>
@@ -444,80 +410,45 @@ def dashboard():
             </div>
         </div>
 
-        <!-- Help Modal -->
         <div id="helpModal" class="modal">
             <div class="modal-content">
                 <span class="close" onclick="document.getElementById('helpModal').style.display='none'">&times;</span>
                 <h2>How to Use Fitbit HR to Strava</h2>
                 <hr style="border:0; border-top:1px solid #eee; margin-bottom:20px;">
-                
-                <div class="help-step">
-                    <h4>Step 1: Authenticate</h4>
-                    <p>Ensure both the Strava and Fitbit badges in the header are blue (✓). If not, use the Re-auth buttons in the sidebar.</p>
-                </div>
-
-                <div class="help-step">
-                    <h4>Step 2: Scan for Missing Data</h4>
-                    <p>Use <b>Scan History</b> to see how many activities are missing heart rate data. "Fixable" means matching heart rate data was found in your Fitbit account.</p>
-                </div>
-
-                <div class="help-step">
-                    <h4>Step 3: Sync Activities</h4>
-                    <p>Enter how many activities to process (Activity Count) and how far back to look (History Depth). Click <b>Start Sync</b>. The original activities will NOT be deleted yet.</p>
-                </div>
-
-                <div class="help-step">
-                    <h4>Step 4: Verify & Cleanup</h4>
-                    <p>Check the "New" activities in the <b>Pending Cleanup</b> table. If they look good, manually delete the <b>Original</b> activities on Strava. Finally, click <b>Verify Manual Deletions</b> to move them to the history table.</p>
-                </div>
-
-                <div style="background:#f8f9fa; padding:15px; border-radius:8px; font-size:0.85em; color:#666;">
-                    <strong>Tip:</strong> We shift the time by 30 seconds (Bypass Duplicate) because Strava often blocks exact time matches even if the heart rate data is different.
-                </div>
+                <div class="help-step"><h4>Step 1: Authenticate</h4><p>Ensure both badges are blue (✓). If not, use the Re-auth buttons.</p></div>
+                <div class="help-step"><h4>Step 2: Scan</h4><p>Use <b>Scan History</b> to find activities missing data. "Fixable" means Fitbit data is available.</p></div>
+                <div class="help-step"><h4>Step 3: Sync</h4><p>Enter <b>Count</b> and <b>History Depth</b>, then click <b>Start Sync</b>.</p></div>
+                <div class="help-step"><h4>Step 4: Cleanup</h4><p>Verify new activities in <b>Pending Cleanup</b>, manually delete originals on Strava, then click <b>Verify Deletions</b>.</p></div>
             </div>
         </div>
 
         <script>
             const consoleBox = document.getElementById('console');
             consoleBox.scrollTop = consoleBox.scrollHeight;
-            
             const eventSource = new EventSource('/stream');
-            
             eventSource.onmessage = function(event) {{
                 const data = event.data.trim();
-                if (data === '[DONE]') {{
-                    setTimeout(() => window.location.reload(), 1500);
-                    return;
-                }}
+                if (data === '[DONE]') {{ setTimeout(() => window.location.reload(), 1500); return; }}
                 if (data.length > 0) {{
                     if (consoleBox.innerText === '--- System Idle ---') consoleBox.innerText = '';
                     consoleBox.innerText += data + '\\n';
                     consoleBox.scrollTop = consoleBox.scrollHeight;
                 }}
             }};
-
             document.querySelectorAll('th').forEach(th => th.addEventListener('click', (() => {{
                 const table = th.closest('table');
                 const tbody = table.querySelector('tbody');
                 const rows = Array.from(tbody.querySelectorAll('tr'));
                 if (rows.length <= 1 && rows[0].cells.length <= 1) return;
-                
                 const index = Array.from(th.parentNode.children).indexOf(th);
                 const asc = th.dataset.asc = th.dataset.asc !== 'true';
-                
                 rows.sort((a, b) => {{
                     const aVal = a.children[index].innerText || a.children[index].textContent;
                     const bVal = b.children[index].innerText || b.children[index].textContent;
                     return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
                 }}).forEach(tr => tbody.appendChild(tr));
             }})));
-
-            // Close modal when clicking outside
-            window.onclick = function(event) {{
-                if (event.target == document.getElementById('helpModal')) {{
-                    document.getElementById('helpModal').style.display = "none";
-                }}
-            }}
+            window.onclick = function(event) {{ if (event.target == document.getElementById('helpModal')) {{ document.getElementById('helpModal').style.display = "none"; }} }}
         </script>
     </body>
     </html>

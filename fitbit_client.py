@@ -3,8 +3,7 @@ import json
 import base64
 import requests
 from datetime import datetime
-
-TOKENS_FILE = "tokens.json"
+from database import SessionLocal, Token
 
 class FitbitClient:
     def __init__(self):
@@ -13,22 +12,30 @@ class FitbitClient:
         self.tokens = self._load_tokens()
         
     def _load_tokens(self):
-        if not os.path.exists(TOKENS_FILE):
-            raise Exception("Tokens file not found. Please run auth.py and login first.")
-        with open(TOKENS_FILE, "r") as f:
-            data = json.load(f)
-            if "fitbit" not in data:
-                raise Exception("Fitbit tokens not found. Please run auth.py and login first.")
-            return data["fitbit"]
+        db = SessionLocal()
+        token_record = db.query(Token).filter(Token.service == "fitbit").first()
+        db.close()
+        if not token_record:
+            raise Exception("Fitbit tokens not found in database. Please login via the dashboard first.")
+        return token_record.other_data
 
     def _save_tokens(self):
-        with open(TOKENS_FILE, "r") as f:
-            data = json.load(f)
-        data["fitbit"] = self.tokens
-        with open(TOKENS_FILE, "w") as f:
-            json.dump(data, f, indent=4)
+        db = SessionLocal()
+        token_record = db.query(Token).filter(Token.service == "fitbit").first()
+        if not token_record:
+            token_record = Token(service="fitbit")
+            db.add(token_record)
+        
+        token_record.access_token = self.tokens.get("access_token")
+        token_record.refresh_token = self.tokens.get("refresh_token")
+        token_record.expires_at = self.tokens.get("expires_in") # Fitbit uses expires_in
+        token_record.other_data = self.tokens
+        
+        db.commit()
+        db.close()
 
     def _refresh_token(self):
+        print("  Refreshing Fitbit token...")
         auth_header = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
         headers = {
             "Authorization": f"Basic {auth_header}",
@@ -41,9 +48,11 @@ class FitbitClient:
         }
         resp = requests.post("https://api.fitbit.com/oauth2/token", headers=headers, data=data)
         if resp.status_code == 200:
+            print("  Fitbit token refresh successful.")
             self.tokens = resp.json()
             self._save_tokens()
         else:
+            print(f"  Fitbit token refresh failed: {resp.status_code} - {resp.text}")
             raise Exception(f"Failed to refresh Fitbit token: {resp.text}")
 
     def _request(self, method, url, **kwargs):
@@ -53,7 +62,6 @@ class FitbitClient:
         
         resp = requests.request(method, url, **kwargs)
         if resp.status_code == 401: # Token expired
-            print("  Fitbit token expired, refreshing...")
             self._refresh_token()
             headers["Authorization"] = f"Bearer {self.tokens['access_token']}"
             resp = requests.request(method, url, **kwargs)
@@ -77,7 +85,6 @@ class FitbitClient:
         try:
             dataset = data["activities-heart-intraday"]["dataset"]
             for point in dataset:
-                # Format: 'HH:MM:SS' -> value
                 hr_points[point["time"]] = point["value"]
         except KeyError:
             pass

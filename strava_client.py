@@ -2,8 +2,7 @@ import os
 import json
 import requests
 import time
-
-TOKENS_FILE = "tokens.json"
+from database import SessionLocal, Token
 
 class StravaClient:
     def __init__(self):
@@ -12,24 +11,28 @@ class StravaClient:
         self.tokens = self._load_tokens()
 
     def _load_tokens(self):
-        if not os.path.exists(TOKENS_FILE):
-            raise Exception("Tokens file not found. Please run auth.py and login first.")
-        with open(TOKENS_FILE, "r") as f:
-            data = json.load(f)
-            if "strava" not in data:
-                raise Exception("Strava tokens not found. Please run auth.py and login first.")
-            return data["strava"]
+        db = SessionLocal()
+        token_record = db.query(Token).filter(Token.service == "strava").first()
+        db.close()
+        if not token_record:
+            raise Exception("Strava tokens not found in database. Please login via the dashboard first.")
+        # We use other_data as the base because it contains all Strava-specific fields (athlete, etc.)
+        return token_record.other_data
 
     def _save_tokens(self):
-        if not os.path.exists(TOKENS_FILE):
-            data = {}
-        else:
-            with open(TOKENS_FILE, "r") as f:
-                data = json.load(f)
+        db = SessionLocal()
+        token_record = db.query(Token).filter(Token.service == "strava").first()
+        if not token_record:
+            token_record = Token(service="strava")
+            db.add(token_record)
         
-        data["strava"] = self.tokens
-        with open(TOKENS_FILE, "w") as f:
-            json.dump(data, f, indent=4)
+        token_record.access_token = self.tokens.get("access_token")
+        token_record.refresh_token = self.tokens.get("refresh_token")
+        token_record.expires_at = self.tokens.get("expires_at")
+        token_record.other_data = self.tokens
+        
+        db.commit()
+        db.close()
 
     def _refresh_token(self):
         print("  Refreshing Strava token...")
@@ -83,16 +86,11 @@ class StravaClient:
         return self._request("GET", url)
 
     def upload_activity(self, file_path, data_type="tcx", name=None, description=None, trainer=0, commute=0, gear_id=None, activity_type=None):
-        # We handle upload separately because it uses multipart/form-data and polling
         url = "https://www.strava.com/api/v3/uploads"
         
         def do_post():
             headers = {"Authorization": f"Bearer {self.tokens['access_token']}"}
-            data = {
-                "data_type": data_type,
-                "trainer": trainer,
-                "commute": commute
-            }
+            data = {"data_type": data_type, "trainer": trainer, "commute": commute}
             if name: data["name"] = name
             if description: data["description"] = description
             if gear_id: data["gear_id"] = gear_id
@@ -125,7 +123,6 @@ class StravaClient:
             
             check_resp.raise_for_status()
             status_data = check_resp.json()
-            
             print(f"    Status: {status_data.get('status')}")
             
             if status_data.get("activity_id"):
