@@ -2,67 +2,85 @@ import os
 import json
 import time
 import argparse
+import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from fitbit_client import FitbitClient
 from strava_client import StravaClient
 from merger import create_tcx, parse_tcx, parse_fit
-from database import SessionLocal, SyncedActivity, SkippedActivity, ScanResult, init_db
+from database import SessionLocal, SyncedActivity, SkippedActivity, ScanResult, FixableActivity, init_db
+
+# Helper to always flush print
+def log(msg):
+    print(msg, flush=True)
+
+def decrement_scan_count(db, was_fixable=True, act_id=None):
+    scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
+    if scan_record:
+        if scan_record.count > 0:
+            scan_record.count -= 1
+        if was_fixable and scan_record.fixable_count > 0:
+            scan_record.fixable_count -= 1
+        db.commit()
+    if act_id:
+        db.query(FixableActivity).filter(FixableActivity.id == str(act_id)).delete()
+        db.commit()
 
 def cleanup_activities(strava):
     db = SessionLocal()
-    pending = db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").all()
-    
-    if not pending:
-        # Check if we need to backfill completed ones too
-        completed = db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()
-        if not completed:
-            print("No activities in database.")
-            db.close()
-            return
-        all_to_check = completed
-    else:
-        all_to_check = pending + db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()
+    try:
+        pending = db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").all()
+        
+        if not pending:
+            completed = db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()
+            if not completed:
+                log("No activities in database.")
+                return
+            all_to_check = completed
+        else:
+            all_to_check = pending + db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()
 
-    print(f"Verifying {len(pending)} pending activities on Strava...")
-    
-    import requests
-    for item in pending:
-        try:
-            strava.get_activity_streams(item.old_id)
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                print(f"  Confirmed: Activity {item.old_id} was manually deleted. Moving to completed.")
-                item.status = "completed"
-                db.commit()
-        except Exception:
-            pass
-
-    print("Backfilling missing stats from Strava...")
-    for item in all_to_check:
-        if item.distance_mi is None or item.elevation_gain_ft is None or not item.name or item.name == 'N/A':
+        log(f"Verifying {len(pending)} pending activities on Strava...")
+        
+        import requests
+        for item in pending:
             try:
-                if not item.new_id: continue
-                print(f"  Fetching stats for new activity {item.new_id}...")
-                url = f"https://www.strava.com/api/v3/activities/{item.new_id}"
-                act_data = strava._request("GET", url)
-                
-                item.name = act_data.get("name", item.name)
-                item.distance_mi = round(act_data.get("distance", 0) / 1609.34, 2)
-                item.duration_min = round(act_data.get("moving_time", 0) / 60.0, 1)
-                
-                if act_data.get("total_elevation_gain"):
-                    item.elevation_gain_ft = int(act_data.get("total_elevation_gain") * 3.28084)
-                else:
-                    item.elevation_gain_ft = 0
-                
-                db.commit()
-                time.sleep(0.5)
+                log(f"  Checking {item.old_id}...")
+                strava.get_activity_streams(item.old_id)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    log(f"  Confirmed: Activity {item.old_id} was manually deleted. Moving to completed.")
+                    item.status = "completed"
+                    db.commit()
+                    decrement_scan_count(db, was_fixable=True, act_id=item.old_id)
             except Exception as e:
-                print(f"  Failed to backfill {item.new_id}: {e}")
+                log(f"  Unexpected error checking {item.old_id}: {e}")
 
-    db.close()
-    print("\nCleanup and backfill complete.")
+        log("Backfilling missing stats from Strava...")
+        for item in all_to_check:
+            if item.distance_mi is None or item.elevation_gain_ft is None or not item.name or item.name == 'N/A' or not item.name:
+                try:
+                    if not item.new_id: continue
+                    log(f"  Fetching stats for new activity {item.new_id}...")
+                    url = f"https://www.strava.com/api/v3/activities/{item.new_id}"
+                    act_data = strava._request("GET", url)
+                    
+                    item.name = act_data.get("name", item.name)
+                    item.distance_mi = round(act_data.get("distance", 0) / 1609.34, 2)
+                    item.duration_min = round(act_data.get("moving_time", 0) / 60.0, 1)
+                    
+                    if act_data.get("total_elevation_gain"):
+                        item.elevation_gain_ft = int(act_data.get("total_elevation_gain") * 3.28084)
+                    else:
+                        item.elevation_gain_ft = 0
+                    
+                    db.commit()
+                    time.sleep(0.5)
+                except Exception as e:
+                    log(f"  Failed to backfill {item.new_id}: {e}")
+    finally:
+        db.close()
+        log("\nCleanup and backfill complete.")
 
 def parse_date(date_str):
     if not date_str: return None
@@ -79,6 +97,7 @@ def main():
     parser.add_argument("--file", type=str, help="Process a local FIT/TCX file.")
     parser.add_argument("--bypass-duplicate", action="store_true", help="Shift start time by 30 seconds.")
     parser.add_argument("--force-elevation", action="store_true", help="Omit device info.")
+    parser.add_argument("--only-fixable", action="store_true", help="Only process activities identified as fixable in the last scan.")
     args = parser.parse_args()
 
     load_dotenv()
@@ -88,7 +107,7 @@ def main():
     try:
         strava = StravaClient()
     except Exception as e:
-        print(f"Error initializing Strava client: {e}")
+        log(f"Error initializing Strava client: {e}")
         db.close()
         return
 
@@ -100,39 +119,69 @@ def main():
     try:
         fitbit = FitbitClient()
     except Exception as e:
-        print(f"Error initializing Fitbit client: {e}")
+        log(f"Error initializing Fitbit client: {e}")
         db.close()
         return
 
     # Load exclusions from DB
     completed_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()}
     pending_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").all()}
-    skipped_ids = {a.id for a in db.query(SkippedActivity).all()}
+    
+    raw_skipped = db.query(SkippedActivity).all()
+    skipped_ids = {a.id for a in raw_skipped}
     
     missing_hr_data = []
 
     if args.file:
         if args.file.lower().endswith(".fit"):
-            print(f"Loading local FIT file: {args.file}")
+            log(f"Loading local FIT file: {args.file}")
             activity, streams = parse_fit(args.file)
         else:
-            print(f"Loading local TCX file: {args.file}")
+            log(f"Loading local TCX file: {args.file}")
             activity, streams = parse_tcx(args.file)
         
         has_hr = activity.get("has_heartrate") or (streams.get("heartrate") and any(h is not None for h in streams["heartrate"].get("data", [])))
         if has_hr:
-            print(f"  [Skip] Local file already contains heart rate data.")
+            log(f"  [Skip] Local file already contains heart rate data.")
             db.close()
             return
 
         act_id = os.path.basename(args.file).split(".")[0]
         activity["id"] = act_id
         missing_hr_data.append((activity, streams))
-    else:
-        print(f"Fetching Strava activities ({args.pages} pages)...")
+    elif args.only_fixable:
+        from database import FixableActivity
+        log("Fetching fixable activities from database...")
+        fixable_recs = db.query(FixableActivity).all()
+        if not fixable_recs:
+            log("No fixable activities found. Please run a scan first.")
+            db.close()
+            return
+
+        processed_count = 0
+        for rec in fixable_recs:
+            try:
+                log(f"  Loading fixable activity {rec.id} from cache...")
+                # We have EVERYTHING in the database now
+                activity = rec.activity_data
+                streams = rec.streams_data
+                
+                # Ensure compatibility with existing loop
+                activity["id"] = rec.id
+                activity["cached_hr_data"] = rec.hr_data
+                
+                missing_hr_data.append((activity, streams))
+                processed_count += 1
+                if args.limit > 0 and processed_count >= args.limit:
+                    break
+            except Exception as e:
+                log(f"  [Skip] Error loading cached data for {rec.id}: {e}")
+                continue
+
+        log(f"Fetching Strava activities ({args.pages} pages)...")
         activities = []
         for p in range(1, args.pages + 1):
-            print(f"  Page {p}...")
+            log(f"  Page {p}...")
             page_data = strava.get_activities(per_page=50, page=p)
             if not page_data: break
             activities.extend(page_data)
@@ -140,14 +189,14 @@ def main():
         
         target_activities = []
         if args.id:
-            target_activities = [a for a in activities if a["id"] == args.id]
+            target_activities = [a for a in activities if str(a["id"]) == str(args.id)]
         else:
             for a in activities:
                 a_id = str(a["id"])
                 if a.get("has_heartrate") or a_id in completed_ids or a_id in pending_ids or a_id in skipped_ids:
                     continue
                 if a.get("total_photo_count", 0) > 0:
-                    print(f"  [Skip] Activity {a_id} has photos.")
+                    log(f"  [Skip] Activity {a_id} has photos.")
                     skipped = SkippedActivity(id=a_id, name=a.get("name", "Unknown") + " (Has Photos)", date=a.get("start_date_local", "N/A"))
                     db.merge(skipped)
                     db.commit()
@@ -155,7 +204,7 @@ def main():
                 target_activities.append(a)
 
         if not target_activities:
-            print("No activities found to process.")
+            log("No activities found to process.")
             db.close()
             return
             
@@ -164,20 +213,20 @@ def main():
         
         for activity in target_activities:
             try:
-                print(f"  Fetching streams for {activity['id']}...")
+                log(f"  Fetching streams for {activity['id']}...")
                 streams = strava.get_activity_streams(activity["id"])
                 missing_hr_data.append((activity, streams))
             except Exception as e:
                 if "404" in str(e):
-                    print(f"  [Skip] Activity {activity['id']} not found.")
+                    log(f"  [Skip] Activity {activity['id']} not found.")
                     skipped = SkippedActivity(id=str(activity['id']), name=activity.get("name", "Unknown"), date=activity.get("start_date_local", "N/A"))
                     db.merge(skipped)
                     db.commit()
                 else:
-                    print(f"  [Skip] Could not fetch streams for {activity['id']}: {e}")
+                    log(f"  [Skip] Could not fetch streams for {activity['id']}: {e}")
                 continue
 
-    print(f"Processing {len(missing_hr_data)} activities.")
+    log(f"Processing {len(missing_hr_data)} activities.")
     os.makedirs("backups", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
     
@@ -185,7 +234,7 @@ def main():
         act_id = str(activity["id"])
         act_name = activity.get("name", "Unknown Activity")
         start_date_local = activity.get("start_date_local")
-        print(f"\n--- Processing Activity {act_id}: {act_name} ---")
+        log(f"\n--- Processing Activity {act_id}: {act_name} ---")
         
         if not args.file: time.sleep(1)
         
@@ -196,17 +245,25 @@ def main():
         
         if not act_duration_sec: act_duration_sec = 3600
         end_dt = start_dt + timedelta(seconds=act_duration_sec)
-        date_str = start_dt.strftime("%Y-%m-%d")
-        s_time, e_time = start_dt.strftime("%H:%M"), (end_dt + timedelta(minutes=5)).strftime("%H:%M")
+        date_str, s_time, e_time = start_dt.strftime("%Y-%m-%d"), start_dt.strftime("%H:%M"), (end_dt + timedelta(minutes=5)).strftime("%H:%M")
         
         try:
-            print(f"  Fetching Fitbit HR data...")
-            hr_data = fitbit.get_hr_data(date_str, s_time, e_time)
+            hr_data = activity.get("cached_hr_data")
+            if hr_data:
+                log(f"  Using cached heart rate data ({len(hr_data)} pts).")
+            else:
+                log(f"  Fetching Fitbit HR data...")
+                hr_data = fitbit.get_hr_data(date_str, s_time, e_time)
+            
             if not hr_data:
-                print("  No Fitbit HR data found.")
+                log("  No Fitbit HR data found.")
                 continue
                 
-            print(f"  Found {len(hr_data)} HR data points.")
+            if not isinstance(hr_data, dict): # Handle list case if fitbit changed it
+                log("  Wait, hr_data is not a dict. Skipping.")
+                continue
+
+            log(f"  Total HR points: {len(hr_data)}")
             if not args.file:
                 backup_file = f"backups/{act_id}_original.tcx"
                 create_tcx(activity, streams, {}, backup_file, include_creator=(not args.force_elevation))
@@ -216,7 +273,7 @@ def main():
                 start_dt_local_dt = parse_date(activity.get('start_date_local'))
                 activity['start_date'] = (start_dt_utc + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 activity['start_date_local'] = (start_dt_local_dt + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                print("  Applied 30-second shift.")
+                log("  Applied 30-second shift.")
 
             output_file = f"outputs/{act_id}_with_hr.tcx"
             create_tcx(activity, streams, hr_data, output_file, include_creator=(not args.force_elevation))
@@ -231,33 +288,35 @@ def main():
                 total_gain_ft = int(gain_m * 3.28084)
             dist_mi = (streams.get("distance", {}).get("data", [-1])[-1] / 1609.34) if streams.get("distance") else 0
 
-            if args.dry_run:
-                print("  Dry-run: skipping upload.")
-            else:
-                print("  Attempting upload to Strava...")
-                desc = (activity.get("description", "") or "") + "\n\n(Heart rate data added via Fitbit sync)"
-                act_type = (activity.get("sport_type") or activity.get("type", "")).replace(" ", "")
-                
-                upload_resp = strava.upload_activity(
-                    file_path=output_file, data_type="tcx", name=act_name, 
-                    description=desc, trainer=activity.get("trainer", False), 
-                    commute=activity.get("commute", False), gear_id=activity.get("gear_id"), 
-                    activity_type=act_type
-                )
-                new_id = str(upload_resp.get("activity_id"))
-                print(f"  Upload successful! New Activity: https://www.strava.com/activities/{new_id}")
-                if act_type: strava.update_activity(new_id, sport_type=act_type)
+            log("  Attempting upload to Strava...")
+            desc = (activity.get("description", "") or "") + "\n\n(Heart rate data added via Fitbit sync)"
+            act_type = (activity.get("sport_type") or activity.get("type", "")).replace(" ", "")
+            
+            upload_resp = strava.upload_activity(
+                file_path=output_file, data_type="tcx", name=act_name, 
+                description=desc, trainer=activity.get("trainer", False), 
+                commute=activity.get("commute", False), gear_id=activity.get("gear_id"), 
+                activity_type=act_type
+            )
+            new_id = str(upload_resp.get("activity_id"))
+            log(f"  Upload successful! New Activity: https://www.strava.com/activities/{new_id}")
+            if act_type: strava.update_activity(new_id, sport_type=act_type)
 
-                synced = SyncedActivity(
-                    old_id=act_id, new_id=new_id, name=act_name, date=start_date_local,
-                    status="pending_cleanup", distance_mi=round(dist_mi, 2),
-                    duration_min=round(act_duration_sec / 60.0, 1), elevation_gain_ft=total_gain_ft
-                )
-                db.merge(synced)
-                db.commit()
+            synced = SyncedActivity(
+                old_id=act_id, new_id=new_id, name=act_name, date=start_date_local,
+                status="pending_cleanup", distance_mi=round(dist_mi, 2),
+                duration_min=round(act_duration_sec / 60.0, 1), elevation_gain_ft=total_gain_ft
+            )
+            db.merge(synced)
+            db.commit()
+            # AUTO-DECREMENT AND REMOVE FROM FIXABLE
+            decrement_scan_count(db, was_fixable=True, act_id=act_id)
         
         except Exception as e:
-            print(f"  Error processing activity {act_id}: {e}")
+            if "429" in str(e):
+                log(f"  [Error] Fitbit Rate Limit Reached (429). Stopping sync.")
+                sys.exit(1)
+            log(f"  Error processing activity {act_id}: {e}")
             continue
     
     db.close()

@@ -42,6 +42,15 @@ class SkippedActivity(Base):
     date = Column(String(100))
     reason = Column(String(255))
 
+class FixableActivity(Base):
+    __tablename__ = "fixable_activities"
+    id = Column(String(100), primary_key=True)
+    name = Column(String(255))
+    date = Column(String(100))
+    hr_data = Column(JSON) # Cache Fitbit heart rate data
+    activity_data = Column(JSON) # Cache Strava activity metadata
+    streams_data = Column(JSON) # Cache Strava sensor streams
+
 class ScanResult(Base):
     __tablename__ = "scan_results"
     id = Column(Integer, primary_key=True, default=1)

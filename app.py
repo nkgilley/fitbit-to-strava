@@ -6,10 +6,11 @@ import subprocess
 import threading
 import time
 import queue
-from flask import Flask, request, redirect, url_for, session, Response
+from flask import Flask, request, redirect, url_for, session, Response, jsonify
 from datetime import datetime
+from sqlalchemy import or_
 from dotenv import load_dotenv
-from database import init_db, SessionLocal, Token, SyncedActivity, SkippedActivity, ScanResult
+from database import init_db, SessionLocal, Token, SyncedActivity, SkippedActivity, ScanResult, FixableActivity
 
 load_dotenv()
 init_db()
@@ -37,17 +38,18 @@ FITBIT_TOKEN_URL = "https://api.fitbit.com/oauth2/token"
 
 def save_tokens(service, token_data):
     db = SessionLocal()
-    token = db.query(Token).filter(Token.service == service).first()
-    if not token:
-        token = Token(service=service)
-        db.add(token)
-    
-    token.access_token = token_data.get("access_token")
-    token.refresh_token = token_data.get("refresh_token")
-    token.expires_at = token_data.get("expires_at") or token_data.get("expires_in")
-    token.other_data = token_data
-    db.commit()
-    db.close()
+    try:
+        token = db.query(Token).filter(Token.service == service).first()
+        if not token:
+            token = Token(service=service)
+            db.add(token)
+        token.access_token = token_data.get("access_token")
+        token.refresh_token = token_data.get("refresh_token")
+        token.expires_at = token_data.get("expires_at") or token_data.get("expires_in")
+        token.other_data = token_data
+        db.commit()
+    finally:
+        db.close()
 
 def log_terminal(line):
     global terminal_history
@@ -66,19 +68,26 @@ def run_command_stream(cmd):
     if not os.path.exists(python_bin):
         python_bin = "python3"
     
+    # Silence Python warnings
+    env = os.environ.copy()
+    env["PYTHONWARNINGS"] = "ignore"
+    
     full_cmd = [python_bin] + cmd
     
     try:
         process = subprocess.Popen(
-            full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+            full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env
         )
         for line in iter(process.stdout.readline, ""):
-            log_terminal(line.strip())
+            stripped = line.strip()
+            log_terminal(stripped)
+            if stripped:
+                process_status["message"] = stripped
         process.wait()
         if process.returncode == 0:
             process_status["message"] = "Process finished successfully."
         else:
-            process_status["message"] = f"Process failed with exit code {process.returncode}."
+            process_status["message"] = f"Process failed (Exit {process.returncode})."
         log_terminal("[DONE]")
     except Exception as e:
         process_status["message"] = f"Execution failed: {str(e)}"
@@ -99,57 +108,82 @@ def run_scan_in_background(pages):
         strava = StravaClient()
         fitbit = FitbitClient()
         db = SessionLocal()
-        
-        completed_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()}
-        pending_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").all()}
-        skipped_ids = {a.id for a in db.query(SkippedActivity).all()}
+        try:
+            completed_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "completed").all()}
+            pending_ids = {a.old_id for a in db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").all()}
+            skipped_ids = {a.id for a in db.query(SkippedActivity).all()}
 
-        missing_count = 0
-        fixable_count = 0
-        
-        for p in range(1, int(pages) + 1):
-            log_terminal(f"Scanning Strava page {p}...")
-            activities = strava.get_activities(per_page=50, page=p)
-            if not activities: break
+            missing_count = 0
+            fixable_count = 0
             
-            for a in activities:
-                a_id = str(a["id"])
-                if a.get("has_heartrate") or a_id in completed_ids or a_id in pending_ids or a_id in skipped_ids:
-                    continue
-                if a.get("total_photo_count", 0) > 0: continue
+            db.query(FixableActivity).delete()
+            db.commit()
+
+            for p in range(1, int(pages) + 1):
+                log_terminal(f"Scanning Strava page {p}...")
+                activities = strava.get_activities(per_page=50, page=p)
+                if not activities: break
                 
-                missing_count += 1
-                start_date_local = a.get("start_date_local")
-                if not start_date_local: continue
+                stop_scan = False
+                for a in activities:
+                    a_id = str(a["id"])
+                    if a.get("has_heartrate") or a_id in completed_ids or a_id in pending_ids or a_id in skipped_ids:
+                        continue
+                    if a.get("total_photo_count", 0) > 0: continue
+                    
+                    missing_count += 1
+                    start_date_local = a.get("start_date_local")
+                    if not start_date_local: continue
+                    
+                    start_dt = parse_date(start_date_local)
+                    dur = a.get("elapsed_time") or 3600
+                    end_dt = start_dt + timedelta(seconds=dur)
+                    date_str, s_time, e_time = start_dt.strftime("%Y-%m-%d"), start_dt.strftime("%H:%M"), (end_dt + timedelta(minutes=5)).strftime("%H:%M")
+                    
+                    try:
+                        hr_points = fitbit.get_hr_data(date_str, s_time, e_time)
+                        if hr_points:
+                            fixable_count += 1
+                            # SAVE TO FIXABLE TABLE WITH CACHED HR DATA
+                            fixable = FixableActivity(
+                                id=a_id, 
+                                name=a.get('name'), 
+                                date=start_date_local, 
+                                hr_data=hr_points,
+                                activity_data=a, # Summary activity data
+                                streams_data=strava.get_activity_streams(a_id) # Full high-res sensor streams
+                            )
+                            db.merge(fixable)
+                            db.commit()
+                            log_terminal(f"  [Fixable] {a.get('name')} ({date_str})")
+                        else:
+                            log_terminal(f"  [No Data] {a.get('name')} ({date_str})")
+                    except Exception as e:
+                        if "429" in str(e):
+                            log_terminal("!!! Fitbit Rate Limit Reached (429). Stop scanning and try again later.")
+                            process_status["message"] = "Error: Fitbit Rate Limit (429)"
+                            stop_scan = True
+                            break
+                    time.sleep(1.0) # Slower scan to respect Fitbit limits
                 
-                start_dt = parse_date(start_date_local)
-                dur = a.get("elapsed_time") or 3600
-                end_dt = start_dt + timedelta(seconds=dur)
-                date_str, s_time, e_time = start_dt.strftime("%Y-%m-%d"), start_dt.strftime("%H:%M"), (end_dt + timedelta(minutes=5)).strftime("%H:%M")
+                if stop_scan:
+                    break
                 
-                try:
-                    hr_points = fitbit.get_hr_data(date_str, s_time, e_time)
-                    if hr_points:
-                        fixable_count += 1
-                        log_terminal(f"  [Fixable] {a.get('name')} ({date_str})")
-                    else:
-                        log_terminal(f"  [No Data] {a.get('name')} ({date_str})")
-                except: pass
-                time.sleep(0.3)
+            scan_results["count"] = missing_count
+            scan_results["fixable_count"] = fixable_count
+            scan_results["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-        scan_results["count"] = missing_count
-        scan_results["fixable_count"] = fixable_count
-        scan_results["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
-        if not scan_record:
-            scan_record = ScanResult(id=1)
-            db.add(scan_record)
-        scan_record.count = missing_count
-        scan_record.fixable_count = fixable_count
-        scan_record.last_scan = scan_results["last_scan"]
-        db.commit()
-        db.close()
+            scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
+            if not scan_record:
+                scan_record = ScanResult(id=1)
+                db.add(scan_record)
+            scan_record.count = missing_count
+            scan_record.fixable_count = fixable_count
+            scan_record.last_scan = scan_results["last_scan"]
+            db.commit()
+        finally:
+            db.close()
+            
         log_terminal(f">>> Scan complete. Found {missing_count} total, {fixable_count} fixable.")
     except Exception as e:
         log_terminal(f"Scan failed: {e}")
@@ -171,6 +205,62 @@ def stream():
                 yield "data: \n\n"
     return Response(event_stream(), mimetype="text/event-stream")
 
+@app.route("/api/completed")
+def api_completed():
+    db = SessionLocal()
+    try:
+        search = request.args.get("search", "")
+        page = int(request.args.get("page", 1))
+        sort_col = request.args.get("sort", "date")
+        sort_dir = request.args.get("dir", "desc")
+        per_page = 15
+        
+        query = db.query(SyncedActivity).filter(SyncedActivity.status == "completed")
+        if search:
+            query = query.filter(or_(
+                SyncedActivity.name.ilike(f"%{search}%"),
+                SyncedActivity.old_id.ilike(f"%{search}%"),
+                SyncedActivity.new_id.ilike(f"%{search}%"),
+                SyncedActivity.date.ilike(f"%{search}%")
+            ))
+        
+        # Mapping for sorting
+        col_map = {
+            "date": SyncedActivity.date,
+            "name": SyncedActivity.name,
+            "stats": SyncedActivity.distance_mi # Sort by distance for stats column
+        }
+        order_attr = col_map.get(sort_col, SyncedActivity.date)
+        if sort_dir == "asc":
+            query = query.order_by(order_attr.asc())
+        else:
+            query = query.order_by(order_attr.desc())
+
+        total = query.count()
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = max(1, min(page, pages))
+        
+        activities = query.offset((page - 1) * per_page).limit(per_page).all()
+        
+        results = []
+        for a in activities:
+            results.append({
+                "id": a.old_id,
+                "new_id": a.new_id,
+                "name": a.name,
+                "date": a.date[:10] if a.date else "N/A",
+                "stats": f"{a.distance_mi or 0.0} mi | {a.duration_min or 0.0} min | {a.elevation_gain_ft or 0} ft"
+            })
+            
+        return jsonify({
+            "activities": results,
+            "page": page,
+            "pages": pages,
+            "total": total
+        })
+    finally:
+        db.close()
+
 @app.route("/scan", methods=["POST"])
 def start_scan():
     if scan_results["scanning"]: return "Busy", 400
@@ -182,12 +272,11 @@ def start_scan():
 def start_sync():
     if process_status["running"]: return "Busy", 400
     limit = request.form.get("limit", "1")
-    pages = request.form.get("pages", "1")
-    bypass = "--bypass-duplicate" if "bypass" in request.form else ""
-    force_elev = "--force-elevation" if "force_elev" in request.form else ""
-    cmd = ["main.py", "--limit", limit, "--pages", pages]
-    if bypass: cmd.append(bypass)
-    if force_elev: cmd.append(force_elev)
+    bypass = "bypass" in request.form
+    force_elev = "force_elev" in request.form
+    cmd = ["main.py", "--limit", limit, "--only-fixable"]
+    if bypass: cmd.append("--bypass-duplicate")
+    if force_elev: cmd.append("--force-elevation")
     threading.Thread(target=run_command_stream, args=(cmd,)).start()
     return redirect(url_for("dashboard"))
 
@@ -200,39 +289,38 @@ def start_cleanup():
 @app.route("/clear_skipped", methods=["POST"])
 def clear_skipped():
     db = SessionLocal()
-    db.query(SkippedActivity).delete()
-    db.commit()
-    db.close()
+    try:
+        db.query(SkippedActivity).delete()
+        db.commit()
+    finally:
+        db.close()
     return redirect(url_for("dashboard"))
+
+@app.route("/clear_history", methods=["POST"])
+def clear_history():
+    global terminal_history
+    terminal_history = []
+    return "", 204
 
 @app.route("/dashboard")
 def dashboard():
     db = SessionLocal()
-    
-    # Load scan results
-    scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
-    global scan_results
-    if scan_record and not scan_results["scanning"]:
-        scan_results["count"] = scan_record.count
-        scan_results["fixable_count"] = scan_record.fixable_count
-        scan_results["last_scan"] = scan_record.last_scan
-        scan_results["scanning"] = False
+    try:
+        scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
+        global scan_results
+        if scan_record and not scan_results["scanning"]:
+            scan_results["count"] = scan_record.count
+            scan_results["fixable_count"] = scan_record.fixable_count
+            scan_results["last_scan"] = scan_record.last_scan
+            scan_results["scanning"] = False
 
-    strava_auth = db.query(Token).filter(Token.service == "strava").first() is not None
-    fitbit_auth = db.query(Token).filter(Token.service == "fitbit").first() is not None
-    
-    completed = db.query(SyncedActivity).filter(SyncedActivity.status == "completed").order_by(SyncedActivity.date.desc()).all()
-    pending = db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").order_by(SyncedActivity.date.desc()).all()
-    skipped = db.query(SkippedActivity).all()
-    
-    # Pagination
-    items_per_page = 25
-    total_pages = max(1, (len(completed) + items_per_page - 1) // items_per_page)
-    current_page = max(1, min(int(request.args.get('page', 1)), total_pages))
-    start_idx = (current_page - 1) * items_per_page
-    paginated_completed = completed[start_idx : start_idx + items_per_page]
-    
-    db.close()
+        strava_auth = db.query(Token).filter(Token.service == "strava").first() is not None
+        fitbit_auth = db.query(Token).filter(Token.service == "fitbit").first() is not None
+        
+        pending = db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").order_by(SyncedActivity.date.desc()).all()
+        skipped = db.query(SkippedActivity).all()
+    finally:
+        db.close()
 
     def format_stats(item):
         dist = f"{item.distance_mi or 0.0} mi"
@@ -240,7 +328,7 @@ def dashboard():
         elev = f"{item.elevation_gain_ft or 0} ft"
         return f"{dist} | {dur} | {elev}"
 
-    initial_console = "\\n".join(terminal_history) if terminal_history else "--- System Idle ---"
+    initial_console = "\n".join(terminal_history) if terminal_history else "--- System Idle ---"
 
     html = f'''
     <!DOCTYPE html>
@@ -279,10 +367,12 @@ def dashboard():
             .close {{ color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }}
             .help-step {{ margin-bottom: 20px; padding-left: 15px; border-left: 3px solid #0084ff; }}
             .help-step h4 {{ margin: 0 0 5px 0; color: #0084ff; }}
+            #search-input {{ width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 15px; box-sizing: border-box; }}
             @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
             @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
             .running-text {{ animation: pulse 1.5s infinite; color: #00d1ff; font-weight: bold; }}
         </style>
+        {"<meta http-equiv='refresh' content='5'>" if (process_status["running"] or scan_results["scanning"]) else ""}
     </head>
     <body>
         <div class="header">
@@ -300,7 +390,9 @@ def dashboard():
         </div>
 
         <details class="card" style="padding: 0; border: none; background: transparent;" open>
-            <summary class="console-header">LIVE TERMINAL OUTPUT (Click to Toggle)</summary>
+            <summary class="console-header">LIVE TERMINAL OUTPUT (Click to Toggle)
+                <span onclick="clearConsole(event)" style="float:right; background:#333; padding:0 8px; border-radius:4px; font-weight:normal; font-size:0.9em; margin-top:-2px;">Clear Console</span>
+            </summary>
             <div id="console">{initial_console}</div>
         </details>
 
@@ -325,15 +417,10 @@ def dashboard():
                 <div class="card">
                     <h3>2. Import Data</h3>
                     <form action="/sync" method="post">
-                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-                            <div>
-                                <label style="font-size:0.8em; color:#65676b;">Count</label>
-                                <input type="number" name="limit" value="1" min="1" max="50" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
-                            </div>
-                            <div>
-                                <label style="font-size:0.8em; color:#65676b;">History</label>
-                                <input type="number" name="pages" value="1" min="1" max="50" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
-                            </div>
+                        <div class="form-group" style="margin-bottom: 15px;">
+                            <label style="font-size:0.8em; color:#65676b;">Activity Count (Process)</label>
+                            <input type="number" name="limit" value="1" min="1" max="50" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:4px;">
+                            <p style="font-size:0.75em; color:#31a24c; margin: 4px 0 0 0;">Processing the next N <b>Fixable</b> activities.</p>
                         </div>
                         <div style="margin-bottom:15px; font-size:0.9em;">
                             <input type="checkbox" name="bypass" id="bypass" checked> <label for="bypass">Bypass Duplicate</label><br>
@@ -389,21 +476,21 @@ def dashboard():
 
                 <div class="card" style="padding:0;">
                     <div style="padding:20px; border-bottom:1px solid #ebedf0;">
-                        <h3 style="margin:0;">Recently Completed ({len(completed)})</h3>
+                        <h3 style="margin:0;">Recently Completed</h3>
+                    </div>
+                    <div style="padding: 20px 20px 0 20px;">
+                        <input type="text" id="search-input" placeholder="Search by name, ID, or date..." autocomplete="off">
                     </div>
                     <table id="completed-table">
                         <thead>
                             <tr><th>Date</th><th>Activity Name</th><th>Stats</th><th>Link</th></tr>
                         </thead>
-                        <tbody>
-                            {"<tr><td colspan='4' style='text-align:center; color:#65676b;'>No history yet.</td></tr>" if not paginated_completed else ""}
-                            {"".join([f"<tr><td>{i.date[:10]}</td><td>{i.name}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.new_id}' target='_blank'>View Activity</a></td></tr>" for i in paginated_completed])}
+                        <tbody id="completed-tbody">
+                            <!-- Populated via AJAX -->
                         </tbody>
                     </table>
-                    <div class="pagination">
-                        <a href="?page={current_page - 1}" class="btn btn-secondary" {"style='visibility:hidden'" if current_page <= 1 else ""}>&larr; Prev</a>
-                        <span>Page {current_page} of {total_pages}</span>
-                        <a href="?page={current_page + 1}" class="btn btn-secondary" {"style='visibility:hidden'" if current_page >= total_pages else ""}>Next &rarr;</a>
+                    <div id="pagination-controls" class="pagination">
+                        <!-- Populated via AJAX -->
                     </div>
                     <div style="padding-bottom: 20px;"></div>
                 </div>
@@ -417,12 +504,94 @@ def dashboard():
                 <hr style="border:0; border-top:1px solid #eee; margin-bottom:20px;">
                 <div class="help-step"><h4>Step 1: Authenticate</h4><p>Ensure both badges are blue (✓). If not, use the Re-auth buttons.</p></div>
                 <div class="help-step"><h4>Step 2: Scan</h4><p>Use <b>Scan History</b> to find activities missing data. "Fixable" means Fitbit data is available.</p></div>
-                <div class="help-step"><h4>Step 3: Sync</h4><p>Enter <b>Count</b> and <b>History Depth</b>, then click <b>Start Sync</b>.</p></div>
+                <div class="help-step"><h4>Step 3: Sync</h4><p>Enter <b>Count</b>, then click <b>Start Sync</b>. This only processes activities from your "Fixable" list.</p></div>
                 <div class="help-step"><h4>Step 4: Cleanup</h4><p>Verify new activities in <b>Pending Cleanup</b>, manually delete originals on Strava, then click <b>Verify Deletions</b>.</p></div>
             </div>
         </div>
 
         <script>
+            let currentPage = 1;
+            let currentSearch = '';
+            let currentSort = 'date';
+            let currentDir = 'desc';
+
+            async function fetchCompleted(page = 1, search = '', sort = 'date', dir = 'desc') {{
+                currentPage = page;
+                currentSearch = search;
+                currentSort = sort;
+                currentDir = dir;
+                
+                const response = await fetch(`/api/completed?page=${{page}}&search=${{encodeURIComponent(search)}}&sort=${{sort}}&dir=${{dir}}`);
+                const data = await response.json();
+                
+                const tbody = document.getElementById('completed-tbody');
+                if (data.activities.length === 0) {{
+                    tbody.innerHTML = "<tr><td colspan='4' style='text-align:center; color:#65676b;'>No matching history found.</td></tr>";
+                }} else {{
+                    tbody.innerHTML = data.activities.map(a => `
+                        <tr>
+                            <td>${{a.date}}</td>
+                            <td>${{a.name}}</td>
+                            <td><span class='stat-pill'>${{a.stats}}</span></td>
+                            <td><a href='https://www.strava.com/activities/${{a.new_id}}' target='_blank'>View Activity</a></td>
+                        </tr>
+                    `).join('');
+                }}
+
+                const pagination = document.getElementById('pagination-controls');
+                pagination.innerHTML = `
+                    <button class="btn btn-secondary" onclick="fetchCompleted(${{currentPage - 1}}, currentSearch, currentSort, currentDir)" ${{currentPage <= 1 ? 'disabled style="visibility:hidden"' : ''}}>&larr; Prev</button>
+                    <span>Page ${{data.page}} of ${{data.pages}}</span>
+                    <button class="btn btn-secondary" onclick="fetchCompleted(${{currentPage + 1}}, currentSearch, currentSort, currentDir)" ${{currentPage >= data.pages ? 'disabled style="visibility:hidden"' : ''}}>Next &rarr;</button>
+                `;
+            }}
+
+            // Search with debounce
+            let searchTimeout;
+            document.getElementById('search-input').addEventListener('input', (e) => {{
+                clearTimeout(searchTimeout);
+                searchTimeout = setTimeout(() => fetchCompleted(1, e.target.value, currentSort, currentDir), 300);
+            }});
+
+            // Header sorting
+            document.querySelectorAll('th').forEach(th => th.addEventListener('click', () => {{
+                const table = th.closest('table');
+                const tbody = table.querySelector('tbody');
+                
+                if (tbody.id === 'completed-tbody') {{
+                    // SERVER-SIDE SORTING
+                    const text = th.innerText.toLowerCase();
+                    let col = 'date';
+                    if (text.includes('name')) col = 'name';
+                    if (text.includes('stats')) col = 'stats';
+                    
+                    currentDir = (currentSort === col && currentDir === 'desc') ? 'asc' : 'desc';
+                    fetchCompleted(1, currentSearch, col, currentDir);
+                }} else {{
+                    // CLIENT-SIDE SORTING (Pending table)
+                    const rows = Array.from(tbody.querySelectorAll('tr'));
+                    if (rows.length <= 1 && rows[0].cells.length <= 1) return;
+                    
+                    const index = Array.from(th.parentNode.children).indexOf(th);
+                    const asc = th.dataset.asc = th.dataset.asc !== 'true';
+                    
+                    rows.sort((a, b) => {{
+                        const aVal = a.children[index].innerText || a.children[index].textContent;
+                        const bVal = b.children[index].innerText || b.children[index].textContent;
+                        return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+                    }}).forEach(tr => tbody.appendChild(tr));
+                }}
+            }}));
+
+            // Initial load
+            fetchCompleted();
+
+            function clearConsole(e) {{
+                e.preventDefault(); e.stopPropagation();
+                document.getElementById('console').innerText = '--- Console Cleared ---';
+                fetch('/clear_history', {{method: 'POST'}});
+            }}
+            
             const consoleBox = document.getElementById('console');
             consoleBox.scrollTop = consoleBox.scrollHeight;
             const eventSource = new EventSource('/stream');
@@ -435,19 +604,7 @@ def dashboard():
                     consoleBox.scrollTop = consoleBox.scrollHeight;
                 }}
             }};
-            document.querySelectorAll('th').forEach(th => th.addEventListener('click', (() => {{
-                const table = th.closest('table');
-                const tbody = table.querySelector('tbody');
-                const rows = Array.from(tbody.querySelectorAll('tr'));
-                if (rows.length <= 1 && rows[0].cells.length <= 1) return;
-                const index = Array.from(th.parentNode.children).indexOf(th);
-                const asc = th.dataset.asc = th.dataset.asc !== 'true';
-                rows.sort((a, b) => {{
-                    const aVal = a.children[index].innerText || a.children[index].textContent;
-                    const bVal = b.children[index].innerText || b.children[index].textContent;
-                    return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
-                }}).forEach(tr => tbody.appendChild(tr));
-            }})));
+
             window.onclick = function(event) {{ if (event.target == document.getElementById('helpModal')) {{ document.getElementById('helpModal').style.display = "none"; }} }}
         </script>
     </body>

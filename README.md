@@ -1,14 +1,17 @@
 # Fitbit HR to Strava
 
-This tool automatically fetches missing heart rate data from your Fitbit account and merges it into your existing Strava activities. It identifies Strava activities without heart rate data, downloads their GPS streams, retrieves matching Fitbit HR data, generates a new TCX file, and handles the replacement process.
+This tool automatically fetches missing heart rate data from your Fitbit account and merges it into your existing Strava activities. It identifies Strava activities without heart rate data, downloads their GPS/Sensor streams, retrieves matching Fitbit HR data, and generates a new version for upload.
 
 ## Features
 - **Safety First:** Two-phase sync process (Upload first, Verify/Cleanup later).
-- **Automatic Backups:** Saves the original Strava data as a `.tcx` file in the `backups/` directory before any changes.
-- **Intelligent Merging:** Aligns Fitbit HR data with Strava GPS time streams using UTC/Local time offsets.
-- **Real-time Web Dashboard:** Trigger scans, monitor progress via a live terminal stream, and manage your sync history.
-- **Database Driven:** Uses SQLAlchemy to support any database (SQLite, Postgres, etc.) for secure token and history storage.
-- **Photo Protection:** Automatically skips activities with photos to prevent accidental data loss.
+- **Automatic Backups:** Saves original Strava data as a `.tcx` file in the `backups/` directory.
+- **Deep History Scanning:** Performs a two-step check (Strava missing HR + Fitbit has data) to identify "Fixable" activities.
+- **Local Data Caching:** The deep scan caches **all** metadata and high-res streams (Strava + Fitbit) locally in your database. This makes the final sync near-instant and extremely efficient with API quotas.
+- **Optimized Syncing:** "Only Fixable" mode skips repetitive scanning and targets confirmed activities using cached data.
+- **Real-time Web Dashboard:** Monitor progress via a live terminal stream with persistent history across reloads.
+- **Data Preservation:** Automatically skips activities with photos to prevent accidental data loss.
+- **Unit Support:** Fully supports Imperial units (mi/ft) for all dashboard statistics.
+- **Database Driven:** Uses SQLAlchemy (SQLite by default) for secure token and history management.
 
 ## Setup Instructions
 
@@ -37,23 +40,20 @@ This tool automatically fetches missing heart rate data from your Fitbit account
 
 ## Usage Guide
 
-### 1. Authenticate
-Use the badges in the header to confirm your connection. Use the **Auth Strava** and **Auth Fitbit** buttons in the sidebar if needed.
+### 1. Deep Scan
+Click **Update Scan Count** in the sidebar. This downloads and caches all required data from both Strava and Fitbit. This is the only step that heavily uses your API quotas.
 
-### 2. Scan History
-Click **Update Scan Count** to see how many activities are missing heart rate data and how many are **Fixable** (meaning data exists in your Fitbit account).
+### 2. Instant Sync
+Enter the **Activity Count** you want to process and click **Start Sync**. Since all data is now cached locally, this process is near-instant and only requires a single "Upload" request to Strava per activity.
 
-### 3. Sync
-Set your **Activity Count** (how many to process now) and **History Depth** (how many pages to scan). Click **Start Sync** and watch the progress in the live console.
-
-### 4. Verify & Cleanup
-Check the new activities on Strava. Once verified, manually delete the originals and click **Verify Deletions** to move them to your completed history.
+### 3. Verify & Cleanup
+Check the new activities using the **New** links in the Pending Cleanup table. Once verified, manually delete the **Original** activities on Strava and click **Verify Manual Deletions** to update your history.
 
 ## CLI Usage
 You can still run the core logic from the terminal:
 ```bash
-# Sync recent history
-python main.py --pages 1 --limit 5 --bypass-duplicate
+# Sync using the fixable list (cached data)
+python main.py --only-fixable --limit 5 --bypass-duplicate
 
 # Sync a specific file (Garmin Export)
 python main.py --file ~/Downloads/activity.fit --bypass-duplicate
@@ -64,5 +64,5 @@ python main.py --cleanup
 
 ## Troubleshooting
 - **403 Permission Denied (Fitbit):** Ensure your Fitbit App Type is set to **Personal**. Intraday HR data is restricted for "Server" or "Client" app types.
-- **Duplicate Uploads:** Use the `Bypass Duplicate` checkbox (or `--bypass-duplicate` flag) to shift the start time by 30 seconds, preventing Strava from blocking the upload.
-- **Port Conflicts:** If port 8080 is in use, you can change it at the bottom of `app.py`.
+- **429 Rate Limit (Fitbit):** Fitbit allows ~150 requests per hour. The tool's **Local Data Caching** ensures you only use this quota once per activity.
+- **Duplicate Uploads:** The tool shifts the start time by 30 seconds by default to prevent Strava from blocking the upload.
