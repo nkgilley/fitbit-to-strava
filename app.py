@@ -234,7 +234,6 @@ def dashboard():
     global scan_results
     if not scan_results["scanning"] and "last_scan" in log:
         scan_results.update(log["last_scan"])
-        # CRITICAL: Always ensure scanning is False on initial page load after restart
         scan_results["scanning"] = False
     
     tokens = {}
@@ -247,6 +246,18 @@ def dashboard():
     completed = log.get("completed", [])
     pending = log.get("pending_cleanup", [])
     skipped = log.get("skipped", [])
+    
+    # Sort completed by date descending by default
+    completed.sort(key=lambda x: x.get('date', ''), reverse=True)
+    
+    # Pagination
+    items_per_page = 25
+    total_pages = max(1, (len(completed) + items_per_page - 1) // items_per_page)
+    current_page = max(1, min(int(request.args.get('page', 1)), total_pages))
+    
+    start_idx = (current_page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    paginated_completed = completed[start_idx:end_idx]
     
     def format_stats(item):
         if 'distance_mi' in item: dist = f"{item['distance_mi']} mi"
@@ -290,6 +301,8 @@ def dashboard():
             .console-header {{ background: #1c1e21; color: #31a24c; padding: 8px 15px; border-radius: 6px 6px 0 0; font-size: 0.75em; font-weight: bold; border-left: 4px solid #31a24c; cursor: pointer; }}
             .stat-pill {{ color: #65676b; font-size: 0.85em; }}
             .scan-box {{ background: #f7f9fc; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #e1e4e8; }}
+            
+            .pagination {{ margin-top: 15px; display: flex; justify-content: center; align-items: center; gap: 15px; font-size: 0.9em; }}
             
             @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
             @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
@@ -407,10 +420,17 @@ def dashboard():
                             <tr><th>Date</th><th>Activity Name</th><th>Stats</th><th>Link</th></tr>
                         </thead>
                         <tbody>
-                            {"<tr><td colspan='4' style='text-align:center; color:#65676b;'>No history yet.</td></tr>" if not completed else ""}
-                            {"".join([f"<tr><td>{i.get('date','N/A')[:10]}</td><td>{i.get('name','N/A')}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.get('new_id')}' target='_blank'>View Activity</a></td></tr>" for i in reversed(completed[-20:])])}
+                            {"<tr><td colspan='4' style='text-align:center; color:#65676b;'>No history yet.</td></tr>" if not paginated_completed else ""}
+                            {"".join([f"<tr><td>{i.get('date','N/A')[:10]}</td><td>{i.get('name','N/A')}</td><td><span class='stat-pill'>{format_stats(i)}</span></td><td><a href='https://www.strava.com/activities/{i.get('new_id')}' target='_blank'>View Activity</a></td></tr>" for i in paginated_completed])}
                         </tbody>
                     </table>
+                    
+                    <div class="pagination">
+                        <a href="?page={current_page - 1}" class="btn btn-secondary" {"style='visibility:hidden'" if current_page <= 1 else ""}>&larr; Prev</a>
+                        <span>Page {current_page} of {total_pages}</span>
+                        <a href="?page={current_page + 1}" class="btn btn-secondary" {"style='visibility:hidden'" if current_page >= total_pages else ""}>Next &rarr;</a>
+                    </div>
+                    <div style="padding-bottom: 20px;"></div>
                 </div>
             </div>
         </div>
