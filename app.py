@@ -10,7 +10,7 @@ from flask import Flask, request, redirect, url_for, session, Response, jsonify
 from datetime import datetime
 from sqlalchemy import or_
 from dotenv import load_dotenv
-from database import init_db, SessionLocal, Token, SyncedActivity, SkippedActivity, ScanResult, FixableActivity
+from database import init_db, SessionLocal, Token, SyncedActivity, SkippedActivity, ScanResult, FixableActivity, RateLimit
 
 load_dotenv()
 init_db()
@@ -157,7 +157,16 @@ def run_scan_in_background(pages):
                             db.commit()
                             log_terminal(f"  [Fixable] {a.get('name')} ({date_str})")
                         else:
-                            log_terminal(f"  [No Data] {a.get('name')} ({date_str})")
+                            log_terminal(f"  [No Data] {a.get('name')} ({date_str}) - Skipping forever")
+                            # CACHE UNFIXABLE TO PREVENT RE-QUERIES
+                            unfixable = SkippedActivity(
+                                id=a_id,
+                                name=a.get('name'),
+                                date=start_date_local,
+                                reason="No Fitbit HR data found"
+                            )
+                            db.merge(unfixable)
+                            db.commit()
                     except Exception as e:
                         if "429" in str(e):
                             log_terminal("!!! Fitbit Rate Limit Reached (429). Stop scanning and try again later.")
@@ -228,7 +237,7 @@ def api_completed():
         col_map = {
             "date": SyncedActivity.date,
             "name": SyncedActivity.name,
-            "stats": SyncedActivity.distance_mi # Sort by distance for stats column
+            "stats": SyncedActivity.distance_mi
         }
         order_attr = col_map.get(sort_col, SyncedActivity.date)
         if sort_dir == "asc":
@@ -274,9 +283,11 @@ def start_sync():
     limit = request.form.get("limit", "1")
     bypass = "bypass" in request.form
     force_elev = "force_elev" in request.form
+    
     cmd = ["main.py", "--limit", limit, "--only-fixable"]
     if bypass: cmd.append("--bypass-duplicate")
     if force_elev: cmd.append("--force-elevation")
+    
     threading.Thread(target=run_command_stream, args=(cmd,)).start()
     return redirect(url_for("dashboard"))
 
@@ -306,6 +317,10 @@ def clear_history():
 def dashboard():
     db = SessionLocal()
     try:
+        # Load rate limits
+        rate_limits = db.query(RateLimit).all()
+        rl_data = {rl.service: rl for rl in rate_limits}
+
         scan_record = db.query(ScanResult).filter(ScanResult.id == 1).first()
         global scan_results
         if scan_record and not scan_results["scanning"]:
@@ -316,7 +331,7 @@ def dashboard():
 
         strava_auth = db.query(Token).filter(Token.service == "strava").first() is not None
         fitbit_auth = db.query(Token).filter(Token.service == "fitbit").first() is not None
-        
+        completed_count = db.query(SyncedActivity).filter(SyncedActivity.status == "completed").count()
         pending = db.query(SyncedActivity).filter(SyncedActivity.status == "pending_cleanup").order_by(SyncedActivity.date.desc()).all()
         skipped = db.query(SkippedActivity).all()
     finally:
@@ -415,6 +430,30 @@ def dashboard():
                 </div>
 
                 <div class="card">
+                    <h3>API Quotas</h3>
+                    <div style="font-size: 0.85em;">
+                        <div style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between;">
+                                <strong>Strava:</strong>
+                                <span>{rl_data.get('strava').remaining if 'strava' in rl_data else '---'} / {rl_data.get('strava').limit if 'strava' in rl_data else '---'}</span>
+                            </div>
+                            <small id="strava-reset" data-target="{rl_data.get('strava').reset_at.isoformat() if 'strava' in rl_data else ''}" style="color:#65676b;">
+                                {rl_data.get('strava').reset_at.strftime('%H:%M:%S') if 'strava' in rl_data else '---'}
+                            </small>
+                        </div>
+                        <div>
+                            <div style="display:flex; justify-content:space-between;">
+                                <strong>Fitbit:</strong>
+                                <span>{rl_data.get('fitbit').remaining if 'fitbit' in rl_data else '---'} / {rl_data.get('fitbit').limit if 'fitbit' in rl_data else '---'}</span>
+                            </div>
+                            <small id="fitbit-reset" data-target="{rl_data.get('fitbit').reset_at.isoformat() if 'fitbit' in rl_data else ''}" style="color:#65676b;">
+                                {rl_data.get('fitbit').reset_at.strftime('%H:%M:%S') if 'fitbit' in rl_data else '---'}
+                            </small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
                     <h3>2. Import Data</h3>
                     <form action="/sync" method="post">
                         <div class="form-group" style="margin-bottom: 15px;">
@@ -476,7 +515,7 @@ def dashboard():
 
                 <div class="card" style="padding:0;">
                     <div style="padding:20px; border-bottom:1px solid #ebedf0;">
-                        <h3 style="margin:0;">Recently Completed</h3>
+                        <h3 style="margin:0;">Recently Completed ({completed_count})</h3>
                     </div>
                     <div style="padding: 20px 20px 0 20px;">
                         <input type="text" id="search-input" placeholder="Search by name, ID, or date..." autocomplete="off">
@@ -502,10 +541,30 @@ def dashboard():
                 <span class="close" onclick="document.getElementById('helpModal').style.display='none'">&times;</span>
                 <h2>How to Use Fitbit HR to Strava</h2>
                 <hr style="border:0; border-top:1px solid #eee; margin-bottom:20px;">
-                <div class="help-step"><h4>Step 1: Authenticate</h4><p>Ensure both badges are blue (✓). If not, use the Re-auth buttons.</p></div>
-                <div class="help-step"><h4>Step 2: Scan</h4><p>Use <b>Scan History</b> to find activities missing data. "Fixable" means Fitbit data is available.</p></div>
-                <div class="help-step"><h4>Step 3: Sync</h4><p>Enter <b>Count</b>, then click <b>Start Sync</b>. This only processes activities from your "Fixable" list.</p></div>
-                <div class="help-step"><h4>Step 4: Cleanup</h4><p>Verify new activities in <b>Pending Cleanup</b>, manually delete originals on Strava, then click <b>Verify Deletions</b>.</p></div>
+                
+                <div class="help-step">
+                    <h4>Step 1: Authenticate</h4>
+                    <p>Ensure both badges at the top are blue (✓). If not, use the <b>Auth</b> buttons in the sidebar to link your accounts.</p>
+                </div>
+
+                <div class="help-step">
+                    <h4>Step 2: Deep Scan (Cache Data)</h4>
+                    <p>Click <b>Update Scan Count</b>. This scans your Strava history and <b>downloads/caches</b> all matching Fitbit heart rate data. This is the only step that uses significant API quota.</p>
+                </div>
+
+                <div class="help-step">
+                    <h4>Step 3: Instant Sync</h4>
+                    <p>Once you have "Fixable" activities, enter a count and click <b>Start Sync</b>. This uses the local cache to instantly merge and upload your activities to Strava.</p>
+                </div>
+
+                <div class="help-step">
+                    <h4>Step 4: Verify & Cleanup</h4>
+                    <p>Check the "New" activities in the <b>Pending Cleanup</b> table. If they look good, manually delete the <b>Original</b> activities on Strava, then click <b>Verify Deletions</b>.</p>
+                </div>
+
+                <div style="background:#f8f9fa; padding:15px; border-radius:8px; font-size:0.85em; color:#666; border-left: 4px solid #31a24c;">
+                    <strong>Tip:</strong> We automatically shift the time by 30 seconds and preserve your original bike/gear settings for every synced activity.
+                </div>
             </div>
         </div>
 
@@ -557,24 +616,18 @@ def dashboard():
             document.querySelectorAll('th').forEach(th => th.addEventListener('click', () => {{
                 const table = th.closest('table');
                 const tbody = table.querySelector('tbody');
-                
                 if (tbody.id === 'completed-tbody') {{
-                    // SERVER-SIDE SORTING
                     const text = th.innerText.toLowerCase();
                     let col = 'date';
                     if (text.includes('name')) col = 'name';
                     if (text.includes('stats')) col = 'stats';
-                    
                     currentDir = (currentSort === col && currentDir === 'desc') ? 'asc' : 'desc';
                     fetchCompleted(1, currentSearch, col, currentDir);
                 }} else {{
-                    // CLIENT-SIDE SORTING (Pending table)
                     const rows = Array.from(tbody.querySelectorAll('tr'));
                     if (rows.length <= 1 && rows[0].cells.length <= 1) return;
-                    
                     const index = Array.from(th.parentNode.children).indexOf(th);
                     const asc = th.dataset.asc = th.dataset.asc !== 'true';
-                    
                     rows.sort((a, b) => {{
                         const aVal = a.children[index].innerText || a.children[index].textContent;
                         const bVal = b.children[index].innerText || b.children[index].textContent;
@@ -583,7 +636,6 @@ def dashboard():
                 }}
             }}));
 
-            // Initial load
             fetchCompleted();
 
             function clearConsole(e) {{
@@ -591,7 +643,6 @@ def dashboard():
                 document.getElementById('console').innerText = '--- Console Cleared ---';
                 fetch('/clear_history', {{method: 'POST'}});
             }}
-            
             const consoleBox = document.getElementById('console');
             consoleBox.scrollTop = consoleBox.scrollHeight;
             const eventSource = new EventSource('/stream');
@@ -604,8 +655,30 @@ def dashboard():
                     consoleBox.scrollTop = consoleBox.scrollHeight;
                 }}
             }};
-
             window.onclick = function(event) {{ if (event.target == document.getElementById('helpModal')) {{ document.getElementById('helpModal').style.display = "none"; }} }}
+
+            function updateCountdowns() {{
+                ['strava', 'fitbit'].forEach(service => {{
+                    const el = document.getElementById(`${{service}}-reset`);
+                    if (!el) return;
+                    const targetStr = el.getAttribute('data-target');
+                    if (!targetStr) return;
+                    
+                    const now = new Date();
+                    const target = new Date(targetStr + "Z"); // Treat as UTC
+                    const diff = target - now;
+                    
+                    if (diff <= 0) {{
+                        el.innerText = "Resets: Now (Execute action to update)";
+                    }} else {{
+                        const m = Math.floor(diff / 60000);
+                        const s = Math.floor((diff % 60000) / 1000);
+                        el.innerText = `Resets in: ${{m}}m ${{s}}s`;
+                    }}
+                }});
+            }}
+            setInterval(updateCountdowns, 1000);
+            updateCountdowns();
         </script>
     </body>
     </html>

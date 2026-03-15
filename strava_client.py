@@ -52,6 +52,37 @@ class StravaClient:
             print(f"  Strava token refresh failed: {resp.status_code} - {resp.text}")
             raise Exception(f"Failed to refresh Strava token: {resp.text}")
 
+    def _update_rate_limits(self, headers):
+        # Strava headers: X-RateLimit-Limit: 100,1000  X-RateLimit-Usage: 1,50
+        # Format is ShortTerm (15min), LongTerm (Daily)
+        limit_str = headers.get("X-RateLimit-Limit")
+        usage_str = headers.get("X-RateLimit-Usage")
+        
+        if limit_str and usage_str:
+            try:
+                short_limit = int(limit_str.split(',')[0])
+                short_usage = int(usage_str.split(',')[0])
+                remaining = short_limit - short_usage
+                
+                db = SessionLocal()
+                from database import RateLimit
+                from datetime import datetime, timedelta
+                
+                rl = db.query(RateLimit).filter(RateLimit.service == "strava").first()
+                if not rl:
+                    rl = RateLimit(service="strava")
+                    db.add(rl)
+                
+                rl.limit = short_limit
+                rl.remaining = remaining
+                # Strava 15-min reset is roughly at the next 15-min boundary
+                now = datetime.utcnow()
+                rl.reset_at = now + timedelta(minutes=(15 - (now.minute % 15)))
+                db.commit()
+                db.close()
+            except:
+                pass
+
     def _request(self, method, url, **kwargs):
         headers = kwargs.get("headers", {})
         headers["Authorization"] = f"Bearer {self.tokens['access_token']}"
@@ -62,6 +93,8 @@ class StravaClient:
             self._refresh_token()
             headers["Authorization"] = f"Bearer {self.tokens['access_token']}"
             resp = requests.request(method, url, **kwargs)
+
+        self._update_rate_limits(resp.headers)
 
         if resp.status_code not in [200, 201, 204]:
             print(f"  Strava API Error ({resp.status_code}): {resp.text}")

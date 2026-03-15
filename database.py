@@ -58,6 +58,13 @@ class ScanResult(Base):
     fixable_count = Column(Integer, default=0)
     last_scan = Column(String(100), default="Never")
 
+class RateLimit(Base):
+    __tablename__ = "rate_limits"
+    service = Column(String(50), primary_key=True) # 'strava' or 'fitbit'
+    limit = Column(Integer)
+    remaining = Column(Integer)
+    reset_at = Column(DateTime)
+
 # Create tables
 def init_db():
     Base.metadata.create_all(bind=engine)

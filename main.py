@@ -52,6 +52,23 @@ def cleanup_activities(strava):
                     log(f"  Confirmed: Activity {item.old_id} was manually deleted. Moving to completed.")
                     item.status = "completed"
                     db.commit()
+                    
+                    # TRIGGER RE-ANALYSIS ON THE NEW ACTIVITY (Force PR scan)
+                    try:
+                        log(f"  Triggering PR/Segment scan for new activity {item.new_id}...")
+                        url = f"https://www.strava.com/api/v3/activities/{item.new_id}"
+                        act_data = strava._request("GET", url)
+                        real_type = act_data.get("sport_type") or act_data.get("type", "Ride")
+                        temp_type = "Hike" if "Hike" not in str(real_type) else "Walk"
+                        
+                        strava.update_activity(item.new_id, sport_type=temp_type)
+                        time.sleep(1)
+                        strava.update_activity(item.new_id, sport_type=real_type)
+                        log(f"  PR scan triggered.")
+                    except Exception as re_err:
+                        log(f"  Warning: Could not trigger PR scan for {item.new_id}: {re_err}")
+
+                    # If we verified a deletion, it's no longer 'missing'
                     decrement_scan_count(db, was_fixable=True, act_id=item.old_id)
             except Exception as e:
                 log(f"  Unexpected error checking {item.old_id}: {e}")
@@ -150,11 +167,10 @@ def main():
         activity["id"] = act_id
         missing_hr_data.append((activity, streams))
     elif args.only_fixable:
-        from database import FixableActivity
-        log("Fetching fixable activities from database...")
+        log("Fetching fixable activities from database cache...")
         fixable_recs = db.query(FixableActivity).all()
         if not fixable_recs:
-            log("No fixable activities found. Please run a scan first.")
+            log("No fixable activities found in cache. Please run a scan first.")
             db.close()
             return
 
@@ -162,11 +178,9 @@ def main():
         for rec in fixable_recs:
             try:
                 log(f"  Loading fixable activity {rec.id} from cache...")
-                # We have EVERYTHING in the database now
+                # Use the cached data
                 activity = rec.activity_data
                 streams = rec.streams_data
-                
-                # Ensure compatibility with existing loop
                 activity["id"] = rec.id
                 activity["cached_hr_data"] = rec.hr_data
                 
@@ -177,7 +191,8 @@ def main():
             except Exception as e:
                 log(f"  [Skip] Error loading cached data for {rec.id}: {e}")
                 continue
-
+    else:
+        # ONLY if no file and not only-fixable
         log(f"Fetching Strava activities ({args.pages} pages)...")
         activities = []
         for p in range(1, args.pages + 1):
@@ -236,7 +251,8 @@ def main():
         start_date_local = activity.get("start_date_local")
         log(f"\n--- Processing Activity {act_id}: {act_name} ---")
         
-        if not args.file: time.sleep(1)
+        if not args.file and not args.only_fixable:
+            time.sleep(1)
         
         start_dt = parse_date(start_date_local)
         act_duration_sec = activity.get("elapsed_time") or activity.get("moving_time")
@@ -259,7 +275,7 @@ def main():
                 log("  No Fitbit HR data found.")
                 continue
                 
-            if not isinstance(hr_data, dict): # Handle list case if fitbit changed it
+            if not isinstance(hr_data, dict):
                 log("  Wait, hr_data is not a dict. Skipping.")
                 continue
 

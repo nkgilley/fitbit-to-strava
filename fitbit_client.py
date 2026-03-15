@@ -55,6 +55,36 @@ class FitbitClient:
             print(f"  Fitbit token refresh failed: {resp.status_code} - {resp.text}")
             raise Exception(f"Failed to refresh Fitbit token: {resp.text}")
 
+    def _update_rate_limits(self, headers):
+        limit = headers.get("Fitbit-Rate-Limit-Limit")
+        remaining = headers.get("Fitbit-Rate-Limit-Remaining")
+        retry_after = headers.get("Retry-After")
+        
+        if limit and remaining:
+            try:
+                db = SessionLocal()
+                from database import RateLimit
+                from datetime import datetime, timedelta
+                
+                rl = db.query(RateLimit).filter(RateLimit.service == "fitbit").first()
+                if not rl:
+                    rl = RateLimit(service="fitbit")
+                    db.add(rl)
+                
+                rl.limit = int(limit)
+                rl.remaining = int(remaining)
+                
+                # If we have a retry_after, use it, otherwise assume 1 hour reset for Fitbit
+                if retry_after:
+                    rl.reset_at = datetime.utcnow() + timedelta(seconds=int(retry_after))
+                else:
+                    rl.reset_at = datetime.utcnow() + timedelta(hours=1)
+                    
+                db.commit()
+                db.close()
+            except:
+                pass
+
     def _request(self, method, url, **kwargs):
         headers = kwargs.get("headers", {})
         headers["Authorization"] = f"Bearer {self.tokens['access_token']}"
@@ -66,6 +96,8 @@ class FitbitClient:
             headers["Authorization"] = f"Bearer {self.tokens['access_token']}"
             resp = requests.request(method, url, **kwargs)
         
+        self._update_rate_limits(resp.headers)
+
         if resp.status_code != 200:
             print(f"  Fitbit API Error ({resp.status_code}): {resp.text}")
             resp.raise_for_status()
