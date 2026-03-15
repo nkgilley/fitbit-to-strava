@@ -12,7 +12,13 @@ from sqlalchemy import or_
 from dotenv import load_dotenv
 from database import init_db, SessionLocal, Token, SyncedActivity, SkippedActivity, ScanResult, FixableActivity, RateLimit
 
-load_dotenv()
+# Load .env from /data if it exists (Docker mode), otherwise local
+data_env = "/data/.env"
+if os.path.exists(data_env):
+    load_dotenv(data_env)
+else:
+    load_dotenv()
+
 init_db()
 
 app = Flask(__name__)
@@ -64,9 +70,10 @@ def run_command_stream(cmd):
     process_status["running"] = True
     process_status["message"] = f"Running: {' '.join(cmd)}"
     
+    # Try venv first, fallback to system python (Docker mode)
     python_bin = os.path.join(os.getcwd(), 'venv', 'bin', 'python')
     if not os.path.exists(python_bin):
-        python_bin = "python3"
+        python_bin = "python"
     
     # Silence Python warnings
     env = os.environ.copy()
@@ -350,6 +357,7 @@ def dashboard():
     <html>
     <head>
         <title>Fitbit HR to Strava</title>
+        <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 38 32'><path d='M19 28.5L17.1 26.8C10.1 21.3 5.5 16.8 5.5 11.3C5.5 6.8 9.1 3.2 13.6 3.2C16.1 3.2 18.5 4.4 20 6.3C21.5 4.4 23.9 3.2 26.4 3.2C30.9 3.2 34.5 6.8 34.5 11.3C34.5 16.8 29.9 21.3 22.9 26.8L21 28.5H19Z' fill='%2300B0B9' opacity='0.8' transform='translate(-3, 0)'/><path d='M19 28.5L17.1 26.8C10.1 21.3 5.5 16.8 5.5 11.3C5.5 6.8 9.1 3.2 13.6 3.2C16.1 3.2 18.5 4.4 20 6.3C21.5 4.4 23.9 3.2 26.4 3.2C30.9 3.2 34.5 6.8 34.5 11.3C34.5 16.8 29.9 21.3 22.9 26.8L21 28.5H19Z' fill='%23FC4C02' opacity='0.8' transform='translate(3, 0)'/></svg>">
         <style>
             body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 0 auto; padding: 20px; background: #f0f2f5; color: #1c1e21; }}
             .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
@@ -368,10 +376,13 @@ def dashboard():
             .auth-badge {{ padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; }}
             .auth-ok {{ background: #e7f3ff; color: #1877f2; }}
             .auth-missing {{ background: #fff0f0; color: #fa3e3e; }}
+            
             .status-bar {{ background: #000; color: #fff; padding: 15px; border-radius: 6px; font-family: monospace; margin-bottom: 20px; border-left: 4px solid #31a24c; font-size: 0.9em; display: flex; align-items: center; }}
             .status-label {{ color: #31a24c; font-weight: bold; margin-right: 10px; }}
+            
             .spinner {{ width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #00d1ff; animation: spin 1s linear infinite; margin-right: 12px; display: none; }}
             .running .spinner {{ display: inline-block; }}
+            
             #console {{ background: #000; color: #fff; padding: 15px; border-radius: 0 0 6px 6px; font-family: monospace; height: 150px; overflow-y: auto; font-size: 0.85em; border-left: 4px solid #31a24c; white-space: pre-wrap; }}
             .console-header {{ background: #1c1e21; color: #31a24c; padding: 8px 15px; border-radius: 6px 6px 0 0; font-size: 0.75em; font-weight: bold; border-left: 4px solid #31a24c; cursor: pointer; }}
             .stat-pill {{ color: #65676b; font-size: 0.85em; }}
@@ -383,6 +394,7 @@ def dashboard():
             .help-step {{ margin-bottom: 20px; padding-left: 15px; border-left: 3px solid #0084ff; }}
             .help-step h4 {{ margin: 0 0 5px 0; color: #0084ff; }}
             #search-input {{ width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 15px; box-sizing: border-box; }}
+            
             @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
             @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
             .running-text {{ animation: pulse 1.5s infinite; color: #00d1ff; font-weight: bold; }}
@@ -391,7 +403,13 @@ def dashboard():
     </head>
     <body>
         <div class="header">
-            <h1>Fitbit HR to Strava</h1>
+            <h1 style="display:flex; align-items:center; gap:12px;">
+                <svg width="42" height="36" viewBox="0 0 38 32" style="margin-bottom:-2px;">
+                    <path d="M19 28.5L17.1 26.8C10.1 21.3 5.5 16.8 5.5 11.3C5.5 6.8 9.1 3.2 13.6 3.2C16.1 3.2 18.5 4.4 20 6.3C21.5 4.4 23.9 3.2 26.4 3.2C30.9 3.2 34.5 6.8 34.5 11.3C34.5 16.8 29.9 21.3 22.9 26.8L21 28.5H19Z" fill="#00B0B9" opacity="0.8" transform="translate(-3, 0)"/>
+                    <path d="M19 28.5L17.1 26.8C10.1 21.3 5.5 16.8 5.5 11.3C5.5 6.8 9.1 3.2 13.6 3.2C16.1 3.2 18.5 4.4 20 6.3C21.5 4.4 23.9 3.2 26.4 3.2C30.9 3.2 34.5 6.8 34.5 11.3C34.5 16.8 29.9 21.3 22.9 26.8L21 28.5H19Z" fill="#FC4C02" opacity="0.8" transform="translate(3, 0)"/>
+                </svg>
+                Fitbit HR to Strava
+            </h1>
             <div>
                 <span class="auth-badge {'auth-ok' if strava_auth else 'auth-missing'}">Strava {'✓' if strava_auth else '✗'}</span>
                 <span class="auth-badge {'auth-ok' if fitbit_auth else 'auth-missing'}">Fitbit {'✓' if fitbit_auth else '✗'}</span>
@@ -723,4 +741,4 @@ def callback_fitbit():
     return f"Error: {resp.text}"
 
 if __name__ == "__main__":
-    app.run(port=8080, debug=True)
+    app.run(host="0.0.0.0", port=8080, debug=False)

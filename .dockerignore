@@ -1,0 +1,28 @@
+# Local development files
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+instance/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data
+data.db
+backups/
+outputs/
+tokens.json
+sync_log.json
+.env
+
+# Git
+.git
+.gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
