@@ -118,7 +118,7 @@ class StravaClient:
         url = "https://www.strava.com/api/v3/athlete"
         return self._request("GET", url)
 
-    def upload_activity(self, file_path, data_type="tcx", name=None, description=None, trainer=0, commute=0, gear_id=None, activity_type=None):
+    def upload_activity(self, file_path, data_type="tcx", name=None, description=None, trainer=0, commute=0, gear_id=None, sport_type=None):
         url = "https://www.strava.com/api/v3/uploads"
         
         def do_post():
@@ -127,7 +127,7 @@ class StravaClient:
             if name: data["name"] = name
             if description: data["description"] = description
             if gear_id: data["gear_id"] = gear_id
-            if activity_type: data["activity_type"] = activity_type
+            if sport_type: data["sport_type"] = sport_type
                 
             with open(file_path, "rb") as f:
                 files = {"file": f}

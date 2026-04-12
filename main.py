@@ -312,7 +312,7 @@ def main():
                 file_path=output_file, data_type="tcx", name=act_name, 
                 description=desc, trainer=activity.get("trainer", False), 
                 commute=activity.get("commute", False), gear_id=activity.get("gear_id"), 
-                activity_type=act_type
+                sport_type=act_type
             )
             new_id = str(upload_resp.get("activity_id"))
             log(f"  Upload successful! New Activity: https://www.strava.com/activities/{new_id}")

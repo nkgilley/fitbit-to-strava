@@ -33,15 +33,15 @@ def create_tcx(activity, streams, hr_data, output_path, include_creator=True):
     strava_type = activity.get("sport_type") or activity.get("type", "Other")
     sport_map = {
         "Ride": "Biking", 
-        "MountainBikeRide": "MountainBikeRide", 
-        "E-BikeRide": "EBikeRide",
-        "GravelRide": "GravelRide", 
+        "MountainBikeRide": "Biking", 
+        "E-BikeRide": "Biking",
+        "GravelRide": "Biking", 
         "RoadRide": "Biking", 
         "Run": "Running", 
         "TrailRun": "Running",
-        "Snowboard": "Snowboard", 
-        "Snowboarding": "Snowboard", 
-        "AlpineSki": "AlpineSki",
+        "Snowboard": "Other", 
+        "Snowboarding": "Other", 
+        "AlpineSki": "Other",
         "Biking": "Biking", 
         "Running": "Running"
     }
